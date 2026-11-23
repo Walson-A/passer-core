@@ -13,9 +13,10 @@
 //! The transport authenticates the remote key (QUIC/TLS 1.3 with raw public keys); the
 //! node never trusts a device id written inside a message.
 
+pub mod approval;
 pub mod frame;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -324,7 +325,7 @@ impl ProtocolHandler for JoinProtocol {
                         let op = Op::Add {
                             device: admission.device,
                             name: admission.name.clone(),
-                            approver: false,
+                            approver: admission.approver,
                         };
                         match self.group.append(&self.identity, op) {
                             Err(e) => JoinReply::Error {
@@ -357,12 +358,77 @@ impl ProtocolHandler for JoinProtocol {
 // Node
 // ---------------------------------------------------------------------------------------
 
+/// Known direct addresses of other devices. Filled from invitations, explicit addresses
+/// and (later) the coordination server; without an entry, address lookup is used.
+#[derive(Clone, Default)]
+pub struct PeerBook(Arc<RwLock<HashMap<DeviceId, EndpointAddr>>>);
+
+impl PeerBook {
+    pub fn remember(&self, addr: EndpointAddr) {
+        if addr.ip_addrs().next().is_some() {
+            self.0.write().expect("peers lock").insert(addr.id, addr);
+        }
+    }
+
+    pub fn addr_of(&self, device: &DeviceId) -> EndpointAddr {
+        self.0
+            .read()
+            .expect("peers lock")
+            .get(device)
+            .cloned()
+            .unwrap_or_else(|| EndpointAddr::new(*device))
+    }
+}
+
+/// One request, one response, on a fresh connection.
+pub(crate) async fn call_peer(
+    endpoint: &Endpoint,
+    peer: EndpointAddr,
+    request: Request,
+) -> anyhow::Result<Response> {
+    let conn = endpoint
+        .connect(peer, BUS_ALPN)
+        .await
+        .map_err(|e| anyhow!("connecting: {e}"))?;
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| anyhow!("opening a stream: {e}"))?;
+    write_frame(&mut send, &request).await?;
+    send.finish()?;
+    let response: Response = read_frame(&mut recv).await?;
+    conn.close(0u32.into(), b"done");
+    Ok(response)
+}
+
+/// How to run a node.
+#[derive(Clone)]
+pub struct NodeOptions {
+    pub network: Network,
+    /// Told about each admitted device, with the SAS code to show.
+    pub on_admitted: Option<AdmissionHook>,
+    /// The approver the bus was built with, so it can reach other devices once the node
+    /// is running.
+    pub approver: Option<Arc<approval::RemoteApprover>>,
+}
+
+impl Default for NodeOptions {
+    fn default() -> Self {
+        Self {
+            network: Network::LocalOnly,
+            on_admitted: None,
+            approver: None,
+        }
+    }
+}
+
 /// A running device.
 pub struct Node {
     identity: Arc<Identity>,
     group: Arc<Group>,
     bus: Arc<Bus>,
     book: Arc<Mutex<InvitationBook>>,
+    peers: PeerBook,
     router: Router,
 }
 
@@ -371,15 +437,26 @@ impl Node {
         identity: Arc<Identity>,
         group: Arc<Group>,
         bus: Arc<Bus>,
-        network: Network,
-        on_admitted: Option<AdmissionHook>,
+        options: NodeOptions,
     ) -> anyhow::Result<Self> {
+        let NodeOptions {
+            network,
+            on_admitted,
+            approver,
+        } = options;
         let endpoint = bind(
             &identity,
             network,
             vec![BUS_ALPN.to_vec(), LOG_ALPN.to_vec(), JOIN_ALPN.to_vec()],
         )
         .await?;
+        let peers = PeerBook::default();
+        if let Some(approver) = &approver {
+            approver.attach(approval::Link {
+                endpoint: endpoint.clone(),
+                peers: peers.clone(),
+            });
+        }
         let book = Arc::new(Mutex::new(InvitationBook::default()));
         let router = Router::builder(endpoint)
             .accept(
@@ -410,8 +487,14 @@ impl Node {
             group,
             bus,
             book,
+            peers,
             router,
         })
+    }
+
+    /// Known addresses of other devices.
+    pub fn peers(&self) -> &PeerBook {
+        &self.peers
     }
 
     pub fn id(&self) -> DeviceId {
@@ -435,14 +518,27 @@ impl Node {
         dialable_addr(self.endpoint())
     }
 
-    /// Issues a one-time invitation. Only an approver may invite.
+    /// Issues a one-time invitation for a plain member. Only an approver may invite.
     pub fn invite(&self, ttl_secs: u64) -> anyhow::Result<Invitation> {
+        self.invite_with(ttl_secs, false)
+    }
+
+    /// Issues a one-time invitation for a device that will be an approver.
+    pub fn invite_approver(&self, ttl_secs: u64) -> anyhow::Result<Invitation> {
+        self.invite_with(ttl_secs, true)
+    }
+
+    fn invite_with(&self, ttl_secs: u64, approver: bool) -> anyhow::Result<Invitation> {
         let membership = self.group.membership();
         if !membership.is_approver(&self.id()) {
             bail!("only an approver device can invite");
         }
         let addrs = self.addr().ip_addrs().map(ToString::to_string).collect();
-        let invitation = Invitation::new(membership.group, self.id(), ttl_secs, now_secs(), addrs);
+        let mut invitation =
+            Invitation::new(membership.group, self.id(), ttl_secs, now_secs(), addrs);
+        if approver {
+            invitation = invitation.as_approver();
+        }
         self.book
             .lock()
             .expect("book lock")
@@ -460,20 +556,8 @@ impl Node {
         if !self.group.is_member(&peer.id) {
             bail!("{} is not a member of this group", peer.id.fmt_short());
         }
-        let conn = self
-            .endpoint()
-            .connect(peer, BUS_ALPN)
-            .await
-            .map_err(|e| anyhow!("connecting: {e}"))?;
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| anyhow!("opening a stream: {e}"))?;
-        write_frame(&mut send, &request).await?;
-        send.finish()?;
-        let response: Response = read_frame(&mut recv).await?;
-        conn.close(0u32.into(), b"done");
-        Ok(response)
+        self.peers.remember(peer.clone());
+        call_peer(self.endpoint(), self.peers.addr_of(&peer.id), request).await
     }
 
     /// Fetches the device log from a peer and adopts it if it is a valid extension.

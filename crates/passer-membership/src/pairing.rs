@@ -38,6 +38,9 @@ pub struct Invitation {
     pub expires_at: u64,
     /// Where the inviter can be reached directly (`ip:port`), for the local network.
     pub addrs: Vec<String>,
+    /// Whether the new device becomes an approver. Decided by the inviter: the joining
+    /// device cannot change it.
+    pub approver: bool,
 }
 
 /// Errors while pairing.
@@ -75,7 +78,14 @@ impl Invitation {
             secret,
             expires_at: now + ttl_secs.min(MAX_TTL_SECS),
             addrs,
+            approver: false,
         }
+    }
+
+    /// The joining device will be an approver (for a second phone, a laptop...).
+    pub fn as_approver(mut self) -> Self {
+        self.approver = true;
+        self
     }
 
     /// The link to show as a QR code. It contains the secret.
@@ -90,6 +100,9 @@ impl Invitation {
         if !self.addrs.is_empty() {
             link.push_str("&a=");
             link.push_str(&self.addrs.join(","));
+        }
+        if self.approver {
+            link.push_str("&r=approver");
         }
         link
     }
@@ -139,6 +152,7 @@ impl Invitation {
             secret: hex32("s")?,
             expires_at,
             addrs,
+            approver: params.get("r") == Some(&"approver"),
         })
     }
 
@@ -211,6 +225,8 @@ pub struct Admission {
     pub device: DeviceId,
     pub name: String,
     pub sas: String,
+    /// Taken from the inviter's own copy of the invitation, never from the request.
+    pub approver: bool,
 }
 
 impl InvitationBook {
@@ -258,6 +274,7 @@ impl InvitationBook {
             device: request.device,
             name: request.name.clone(),
             sas: sas_code(&inv.secret, &inv.inviter, &request.device),
+            approver: inv.approver,
         })
     }
 }
@@ -376,6 +393,40 @@ mod tests {
         );
         // The genuine request still works afterwards.
         assert!(book.redeem(&req, &phone.id(), 150).is_ok());
+    }
+
+    #[test]
+    fn role_comes_from_the_inviter_not_the_link() {
+        let (pc, log, _, mut book) = setup();
+        let plain = Invitation::new(log.group_id().unwrap(), pc.id(), 300, 100, vec![]);
+        book.issue(plain.clone());
+        // The joiner edits its copy of the link to ask for the approver role.
+        let tampered = Invitation::parse_link(&format!("{}&r=approver", plain.to_link())).unwrap();
+        assert!(tampered.approver);
+        let phone = Identity::generate();
+        let admission = book
+            .redeem(
+                &JoinRequest::new(&phone, &tampered, "iPhone"),
+                &phone.id(),
+                150,
+            )
+            .unwrap();
+        assert!(!admission.approver, "the inviter's copy decides");
+
+        let promoted =
+            Invitation::new(log.group_id().unwrap(), pc.id(), 300, 100, vec![]).as_approver();
+        book.issue(promoted.clone());
+        let laptop = Identity::generate();
+        let parsed = Invitation::parse_link(&promoted.to_link()).unwrap();
+        assert!(
+            book.redeem(
+                &JoinRequest::new(&laptop, &parsed, "Laptop"),
+                &laptop.id(),
+                150
+            )
+            .unwrap()
+            .approver
+        );
     }
 
     #[test]

@@ -9,7 +9,7 @@ use passer_device_info::DeviceInfo;
 use passer_identity::Identity;
 use passer_membership::DeviceLog;
 use passer_membership::pairing::Invitation;
-use passer_node::{Group, Network, Node, frame, join, now_secs};
+use passer_node::{Group, Network, Node, NodeOptions, frame, join, now_secs};
 use serde_json::json;
 
 const T: Duration = Duration::from_secs(20);
@@ -23,7 +23,7 @@ async fn spawn_node(identity: Identity, log: DeviceLog, name: &str) -> Node {
             .build()
             .unwrap(),
     );
-    Node::spawn(identity, group, bus, Network::LocalOnly, None)
+    Node::spawn(identity, group, bus, NodeOptions::default())
         .await
         .unwrap()
 }
@@ -200,9 +200,17 @@ async fn admission_hook_reports_the_same_code() {
     let hook: passer_node::AdmissionHook = Arc::new(move |_, name, sas| {
         *hook_seen.lock().unwrap() = Some((name.to_owned(), sas.to_owned()));
     });
-    let pc = Node::spawn(pc_id, group, bus, Network::LocalOnly, Some(hook))
-        .await
-        .unwrap();
+    let pc = Node::spawn(
+        pc_id,
+        group,
+        bus,
+        NodeOptions {
+            on_admitted: Some(hook),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     let inv = pc.invite(300).unwrap();
     let (_, sas) = join(&Identity::generate(), &inv, "iPhone", Network::LocalOnly)
         .await

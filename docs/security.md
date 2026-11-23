@@ -57,8 +57,11 @@ Be explicit about these before anyone relies on the code:
   or deletion of the whole file by someone with disk access.
 - **Join attempts are not rate-limited.** The secret is 256 bits (no brute force), but a
   flood is a denial-of-service vector.
-- **Approvals** have an interface only (`Approver`); routing to a phone is not built, so the
-  default answer to `ask` is *no*.
+- **Approvals** go to the target device's own user and to the group's other approver
+  devices (`RemoteApprover`, `approval.request`); the requesting device is never asked, and
+  names shown come from the approver's own log. Not yet: rate limiting of approval
+  requests (a member could spam prompts), and approvals reaching a phone that is asleep
+  (needs push notifications).
 - **Streams are not implemented**; long-running modules must honour their lease themselves.
 - **n0's public relays** are used by the CLI's default network mode: development only.
 - **No fuzzing yet.** Planned `cargo-fuzz` targets: invitation links, frames, the device log

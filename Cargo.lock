@@ -2358,6 +2358,7 @@ name = "passer-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "directories",
  "iroh",
@@ -2411,6 +2412,7 @@ name = "passer-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "iroh",
  "passer-bus",
  "passer-device-info",

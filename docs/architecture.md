@@ -91,6 +91,15 @@ optional `output_schema`, `effect` (`read` / `write` / `sensitive`), `mode` (`ca
 
 `bus.capabilities` (built in) lists what the caller may invoke — the basis of the MCP bridge.
 
+### Approvals (`passer-node::approval`)
+
+When the policy says `ask`, `RemoteApprover` asks in parallel the target device's own user
+(a local `Prompter`) and every other **approver** device, through their `approval.request`
+capability (`ApprovalModule`). The first answer wins; nobody reachable means *no*. The
+requesting device is never asked — a request cannot approve itself — and the prompt shows
+names taken from the approver's own membership log. Invitations decide the role of the
+device that joins (`invite_approver`); the joining device cannot change it.
+
 ## Planned next
 
 - Server half: registry/presence and an embeddable relay, so Passer's service and a
@@ -99,4 +108,5 @@ optional `output_schema`, `effect` (`read` / `write` / `sensitive`), `mode` (`ca
   bus for identity, permission and signalling.
 - MCP bridge (capabilities → tools) and a local MCP server.
 - Platform key stores, hardware-bound root key; UniFFI bindings for iOS and Android.
-- Approver routing to phones; push of log updates (today: pull with `sync`).
+- Push notifications so approvals reach a sleeping phone; push of log updates (today:
+  pull with `sync`).
