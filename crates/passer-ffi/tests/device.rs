@@ -194,3 +194,35 @@ async fn calls_before_start_are_rejected() {
         Err(PasserError::AlreadyInGroup)
     ));
 }
+
+struct Admissions(Mutex<Vec<(String, String)>>);
+
+impl passer_ffi::AdmissionListener for Admissions {
+    fn admitted(&self, _device_id: String, device_name: String, sas: String) {
+        self.0.lock().unwrap().push((device_name, sas));
+    }
+}
+
+#[tokio::test]
+async fn the_inviting_app_is_told_who_joined_with_the_same_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let pc = PasserDevice::open_on_desktop(dir.path().join("pc")).unwrap();
+    pc.create_group("Walson".into(), "PC".into()).unwrap();
+    let seen = Arc::new(Admissions(Mutex::default()));
+    pc.set_admission_listener(seen.clone());
+    pc.start(NetworkKind::LocalOnly, None).await.unwrap();
+    assert!(pc.is_running().await);
+    assert_eq!(pc.group_name().as_deref(), Some("Walson"));
+
+    let invite = pc.invite(5, false).await.unwrap();
+    let phone = device(&dir, "phone", Arc::default());
+    let joined = phone
+        .join(invite.link, "iPhone".into(), NetworkKind::LocalOnly)
+        .await
+        .unwrap();
+    assert_eq!(
+        *seen.0.lock().unwrap(),
+        vec![("iPhone".to_owned(), joined.sas)]
+    );
+    pc.stop().await;
+}

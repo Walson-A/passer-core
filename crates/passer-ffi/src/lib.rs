@@ -180,6 +180,13 @@ pub trait KeyVault: Send + Sync {
     fn store(&self, secret: Vec<u8>) -> Result<(), PasserError>;
 }
 
+/// Told when a new device has joined through one of this device's invitations.
+#[uniffi::export(with_foreign)]
+pub trait AdmissionListener: Send + Sync {
+    /// `sas` is the 6-digit code the new device also shows: ask the user to compare.
+    fn admitted(&self, device_id: String, device_name: String, sas: String);
+}
+
 /// Asks the person using this device. Implemented natively (sheet, notification).
 #[uniffi::export(with_foreign)]
 #[async_trait]
@@ -327,10 +334,34 @@ pub struct PasserDevice {
     identity: Arc<Identity>,
     modules: Mutex<Vec<AppModule>>,
     prompter: Mutex<Option<Arc<dyn ApprovalPrompter>>>,
+    admissions: Mutex<Option<Arc<dyn AdmissionListener>>>,
     running: tokio::sync::Mutex<Option<Running>>,
 }
 
 impl PasserDevice {
+    fn with_identity(home: PathBuf, identity: Identity) -> Arc<Self> {
+        Arc::new(Self {
+            home,
+            identity: Arc::new(identity),
+            modules: Mutex::default(),
+            prompter: Mutex::default(),
+            admissions: Mutex::default(),
+            running: tokio::sync::Mutex::default(),
+        })
+    }
+
+    /// For desktop apps written in Rust: the key is kept by the platform's store
+    /// (DPAPI on Windows; a file elsewhere until Keychain and Secret Service land), in
+    /// `home/device.key`.
+    pub fn open_on_desktop(home: impl Into<PathBuf>) -> Result<Arc<Self>, PasserError> {
+        let home = home.into();
+        std::fs::create_dir_all(&home).map_err(PasserError::storage)?;
+        let identity = passer_identity::platform_store(home.join("device.key"))
+            .load_or_create()
+            .map_err(PasserError::storage)?;
+        Ok(Self::with_identity(home, identity))
+    }
+
     fn group_path(&self) -> PathBuf {
         self.home.join("group.json")
     }
@@ -390,13 +421,7 @@ impl PasserDevice {
         let identity = VaultStore(vault)
             .load_or_create()
             .map_err(PasserError::storage)?;
-        Ok(Arc::new(Self {
-            home,
-            identity: Arc::new(identity),
-            modules: Mutex::default(),
-            prompter: Mutex::default(),
-            running: tokio::sync::Mutex::default(),
-        }))
+        Ok(Self::with_identity(home, identity))
     }
 
     /// This device's public id (hex).
@@ -470,6 +495,22 @@ impl PasserDevice {
             .push((specs, handler));
     }
 
+    /// Who to tell when a device joins through this device's invitations. Call before
+    /// `start`.
+    pub fn set_admission_listener(&self, listener: Arc<dyn AdmissionListener>) {
+        *self.admissions.lock().expect("admissions lock") = Some(listener);
+    }
+
+    /// The group's name, if this device belongs to one.
+    pub fn group_name(&self) -> Option<String> {
+        self.load_group().ok().map(|g| g.membership().name)
+    }
+
+    /// Whether the device is started.
+    pub async fn is_running(&self) -> bool {
+        self.running.lock().await.is_some()
+    }
+
     /// How to ask this device's user for approvals. Call before `start`.
     pub fn set_approval_prompter(&self, prompter: Arc<dyn ApprovalPrompter>) {
         *self.prompter.lock().expect("prompter lock") = Some(prompter);
@@ -520,7 +561,16 @@ impl PasserDevice {
         let bus = Arc::new(builder.build().map_err(PasserError::invalid)?);
         let options = NodeOptions {
             network: network.into(),
-            on_admitted: None,
+            on_admitted: self
+                .admissions
+                .lock()
+                .expect("admissions lock")
+                .clone()
+                .map(|l| {
+                    Arc::new(move |id: DeviceId, name: &str, sas: &str| {
+                        l.admitted(id.to_string(), name.to_owned(), sas.to_owned())
+                    }) as passer_node::AdmissionHook
+                }),
             approver: Some(approver),
         };
         let node = Arc::new(
