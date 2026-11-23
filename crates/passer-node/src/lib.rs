@@ -574,9 +574,29 @@ impl Node {
         drop(send);
         let log: DeviceLog = read_frame(&mut recv).await?;
         conn.close(0u32.into(), b"done");
-        let removed = self.group.update(log)?;
-        self.revoke(&removed);
+        self.adopt_log(log)
+    }
+
+    /// Adopts a log received from anywhere (a peer, a coordination server).
+    ///
+    /// - a signed extension of ours: adopted, and sessions of removed devices revoked;
+    /// - a prefix of ours (the sender is behind): ignored;
+    /// - anything else (another group, a fork, a forgery): refused.
+    pub fn adopt_log(&self, log: DeviceLog) -> anyhow::Result<Membership> {
+        let ours = self.group.log();
+        if ours.accept_update(&log).is_ok() {
+            let removed = self.group.update(log)?;
+            self.revoke(&removed);
+        } else {
+            log.accept_update(&ours)
+                .context("the received log conflicts with ours")?;
+        }
         Ok(self.group.membership())
+    }
+
+    /// This node's identity (for publishing to a coordination server, for example).
+    pub fn identity(&self) -> &Arc<Identity> {
+        &self.identity
     }
 
     /// Removes a device from the group (approver only, or the device itself).

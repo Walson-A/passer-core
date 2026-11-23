@@ -1,0 +1,28 @@
+[package]
+name = "passer-coord"
+description = "Coordination server for passer-core: distributes signed device logs and addresses, and can read neither content nor forge membership."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "passer-coord"
+path = "src/main.rs"
+
+[dependencies]
+passer-identity = { path = "../passer-identity" }
+passer-membership = { path = "../passer-membership" }
+passer-node = { path = "../passer-node" }
+iroh = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+passer-bus = { path = "../passer-bus" }
+passer-device-info = { path = "../passer-device-info" }

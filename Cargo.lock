@@ -2363,12 +2363,31 @@ dependencies = [
  "directories",
  "iroh",
  "passer-bus",
+ "passer-coord",
  "passer-device-info",
  "passer-identity",
  "passer-membership",
  "passer-node",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "passer-coord"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "iroh",
+ "passer-bus",
+ "passer-device-info",
+ "passer-identity",
+ "passer-membership",
+ "passer-node",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

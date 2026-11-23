@@ -100,10 +100,26 @@ requesting device is never asked — a request cannot approve itself — and the
 names taken from the approver's own membership log. Invitations decide the role of the
 device that joins (`invite_approver`); the joining device cannot change it.
 
+## Server half — coordination (`passer-coord`)
+
+One protocol, `passer-core/coord/1`, one message: a device publishes its device log and its
+direct addresses; the server answers with the group's current log and the presence of the
+other members seen in the last 5 minutes.
+
+- The server keeps, per group, whichever log **extends** the other; it refuses logs that do
+  not verify and forks of the history it holds. It cannot write a log entry itself.
+- It answers only devices that are members of the log it holds. A removed device is told it
+  was removed (and gets the log that says so), nothing else.
+- The device adopts the returned log only if it is a valid extension of its own
+  (`Node::adopt_log`) and remembers addresses only for members of its own verified log.
+- What the server sees: the group's public keys and device names, IP addresses, online
+  times. Never content. A relay (`iroh-relay`, a standard n0 binary) is deployed next to it.
+
+The same crate serves Passer's hosted service (many groups) and a self-hosted engine (one
+group). Accounts, quotas, billing and abuse handling belong to the hosted service, not here.
+
 ## Planned next
 
-- Server half: registry/presence and an embeddable relay, so Passer's service and a
-  self-hosted Atlas engine can both coordinate devices.
 - Streams (file transfer) on the bus; video stays WebRTC in the screen project, with the
   bus for identity, permission and signalling.
 - MCP bridge (capabilities → tools) and a local MCP server.

@@ -51,8 +51,10 @@ Be explicit about these before anyone relies on the code:
 - **No key rotation and no account recovery.** If every approver is lost, the group cannot
   be managed. A printed recovery code is planned; the server must never be able to recover
   on its own.
-- **Log updates are pulled**, not pushed: an offline device learns about a removal only when
-  it syncs. A device that never saw an update cannot detect that it is being withheld.
+- **Log updates** travel through the coordination server (`passer-coord`) or a peer, when a
+  device syncs (every 30 s in the CLI). A device that never saw an update cannot detect that
+  the server withholds it; gossip between devices would reduce this. The server also sees
+  metadata (keys, device names, IPs, online times) and has no rate limiting or quotas yet.
 - **The journal** detects edits and deleted lines in the middle, not truncation of its tail
   or deletion of the whole file by someone with disk access.
 - **Join attempts are not rate-limited.** The secret is 256 bits (no brute force), but a

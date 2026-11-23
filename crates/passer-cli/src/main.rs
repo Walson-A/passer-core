@@ -13,6 +13,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -38,6 +39,10 @@ struct Cli {
     /// `local`: direct addresses only. `n0`: n0's public relays and lookup (development only).
     #[arg(long, value_enum, default_value_t = Net::N0, global = true)]
     network: Net,
+    /// Coordination server, as `<id>@<ip:port>[,<ip:port>...]`: publishes this device's
+    /// presence and log, and learns where the other members are.
+    #[arg(long, env = "PASSER_CORE_COORD", global = true)]
+    coord: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -135,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let home = Home::resolve(cli.home)?;
     let network: Network = cli.network.into();
+    let coord = cli.coord.as_deref().map(parse_coord).transpose()?;
     let identity = platform_store(home.key()).load_or_create()?;
 
     match cli.command {
@@ -217,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
                 on_admitted: Some(hook),
                 approver: Some(approver),
             };
-            let node = Node::spawn(identity, group, bus, options).await?;
+            let node = Arc::new(Node::spawn(identity, group, bus, options).await?);
             if network == Network::N0Dev {
                 node.endpoint().online().await;
             }
@@ -236,9 +242,20 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!("{}\n", inv.to_link());
             }
+            let sync_loop = coord.clone().map(|server| {
+                println!("Syncing with the coordination server every 30 s.");
+                passer_coord::spawn_sync_loop(node.clone(), server, Duration::from_secs(30))
+            });
             println!("Ctrl+C to stop.");
             tokio::signal::ctrl_c().await?;
-            node.shutdown().await?;
+            if let Some(task) = sync_loop {
+                task.abort();
+                let _ = task.await;
+            }
+            match Arc::try_unwrap(node) {
+                Ok(node) => node.shutdown().await?,
+                Err(_) => bail!("the node is still in use"),
+            }
         }
         Command::Join { link, name } => {
             if home.group().exists() {
@@ -265,7 +282,8 @@ async fn main() -> anyhow::Result<()> {
                 Some(s) => serde_json::from_str(&s).context("input must be JSON")?,
                 None => serde_json::json!({}),
             };
-            let (node, peer) = client(identity, &home, network, &device, &addr).await?;
+            let (node, peer) =
+                client(identity, &home, network, &device, &addr, coord.as_ref()).await?;
             let response = node.call(peer, Request::new(&capability, input)).await;
             node.shutdown().await?;
             match response? {
@@ -274,7 +292,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Command::Sync { device, addr } => {
-            let (node, peer) = client(identity, &home, network, &device, &addr).await?;
+            let (node, peer) =
+                client(identity, &home, network, &device, &addr, coord.as_ref()).await?;
             let m = node.sync_log(peer).await;
             node.shutdown().await?;
             let m = m?;
@@ -290,10 +309,19 @@ async fn main() -> anyhow::Result<()> {
             let identity = Arc::new(identity);
             let bus = Arc::new(Bus::builder(Arc::new(NoMembers)).build()?);
             let group = Arc::new(group);
-            let node = Node::spawn(identity, group, bus, NodeOptions::default()).await?;
+            let options = NodeOptions {
+                network,
+                ..Default::default()
+            };
+            let node = Node::spawn(identity, group, bus, options).await?;
             node.remove(target)?;
+            if let Some(server) = coord {
+                passer_coord::sync(&node, server).await?;
+                println!("Removed, and published to the coordination server.");
+            } else {
+                println!("Removed. Other devices learn it at their next `sync`.");
+            }
             node.shutdown().await?;
-            println!("Removed. Other devices learn it at their next `sync`.");
         }
         Command::Journal => {
             let journal = Journal::open(home.journal())?;
@@ -328,6 +356,7 @@ async fn client(
     network: Network,
     device: &str,
     addrs: &[String],
+    coord: Option<&EndpointAddr>,
 ) -> anyhow::Result<(Node, EndpointAddr)> {
     let group =
         Arc::new(Group::load(home.group()).context("no group: run `init` or `join` first")?);
@@ -343,11 +372,25 @@ async fn client(
         },
     )
     .await?;
-    let mut peer = EndpointAddr::new(target);
+    if let Some(server) = coord {
+        passer_coord::sync(&node, server.clone()).await?;
+    }
+    let mut peer = node.peers().addr_of(&target);
     for a in addrs {
         peer = peer.with_ip_addr(a.parse().with_context(|| format!("bad address {a}"))?);
     }
     Ok((node, peer))
+}
+
+/// Parses `<id>@<ip:port>[,<ip:port>...]`.
+fn parse_coord(s: &str) -> anyhow::Result<EndpointAddr> {
+    let (id, addrs) = s.split_once('@').unwrap_or((s, ""));
+    let id: DeviceId = id.parse().context("bad coordination server id")?;
+    let mut addr = EndpointAddr::new(id);
+    for a in addrs.split(',').filter(|a| !a.is_empty()) {
+        addr = addr.with_ip_addr(a.parse().with_context(|| format!("bad address {a}"))?);
+    }
+    Ok(addr)
 }
 
 /// Finds a member by exact name or by a prefix of its id.

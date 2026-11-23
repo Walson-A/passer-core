@@ -16,6 +16,7 @@ passer-identity = { path = "../passer-identity" }
 passer-membership = { path = "../passer-membership" }
 passer-bus = { path = "../passer-bus" }
 passer-node = { path = "../passer-node" }
+passer-coord = { path = "../passer-coord" }
 passer-device-info = { path = "../passer-device-info" }
 iroh = { workspace = true }
 tokio = { workspace = true }

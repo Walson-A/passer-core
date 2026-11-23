@@ -18,6 +18,7 @@ permission check, a time-limited session and a local journal on the device that 
 | L1 Membership | `passer-membership` | A signed, hash-chained device log: only an existing approver can add a device, so a server that stores the log **cannot slip one in**. Pairing by one-time invitation link (QR) with a 6-digit check code. |
 | L2 Transport | `passer-node` | [iroh](https://github.com/n0-computer/iroh) QUIC connections dialed by key: local network first, NAT traversal, relay as a fallback. End-to-end encrypted (TLS 1.3, raw public keys). |
 | L3 Capability bus | `passer-bus` | Devices declare capabilities (schema close to MCP tools). Every call goes through **one** checkpoint on the target: membership, input schema, policy (allow / ask / deny), human approval, visible indicator, lease (stop button), journal without content. |
+| Server half | `passer-coord` | Coordination server: keeps each group's latest signed log and its devices' addresses, so removals reach offline devices and devices find each other across networks. Cannot add a device, never sees content, answers members only. Runs as a hosted service or inside a self-hosted engine. |
 | Example module | `passer-device-info` | The smallest module: `device.info`. The template for writing one. |
 | CLI | `passer-cli` | `passer-core init / serve --invite / join / call / sync / remove / journal`. |
 
@@ -35,6 +36,14 @@ passer-core --home ./pc serve --invite            # prints a one-time join link
 # second device (another terminal or machine)
 passer-core --home ./laptop join '<link>' --name Laptop
 passer-core --home ./laptop call PC device.info
+```
+
+With a coordination server, devices find each other without knowing addresses:
+
+```sh
+passer-coord --home ./coord                      # prints --coord <id>@<ip:port>
+passer-core --home ./pc --coord <id>@<ip:port> serve
+passer-core --home ./laptop --coord <id>@<ip:port> call PC device.info
 ```
 
 Both screens show the same 6-digit code at join time; if they differ, someone is in the
