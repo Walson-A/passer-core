@@ -477,7 +477,8 @@ pub(crate) async fn call_peer(
         .map_err(|e| anyhow!("opening a stream: {e}"))?;
     write_frame(&mut send, &request).await?;
     send.finish()?;
-    let response: Response = read_frame(&mut recv).await?;
+    // The target may be waiting for its user's approval: allow for it.
+    let response: Response = frame::read_frame_within(&mut recv, frame::ANSWER_TIMEOUT).await?;
     conn.close(0u32.into(), b"done");
     Ok(response)
 }

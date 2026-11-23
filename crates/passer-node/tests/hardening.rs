@@ -266,3 +266,39 @@ async fn the_losing_side_replays_its_removals() {
     assert!(!m.is_member(&p.id()) && !m.is_member(&q.id()));
     assert_eq!(pc.group().log(), laptop.group().log(), "both converged");
 }
+
+/// Found testing the desktop app: an approval that takes longer than the request read
+/// timeout made the caller give up. The caller now waits for the human.
+#[tokio::test]
+async fn a_slow_approval_does_not_time_out_the_caller() {
+    struct SlowYes;
+    #[async_trait]
+    impl Prompter for SlowYes {
+        async fn ask(&self, _: &ApprovalPrompt) -> bool {
+            tokio::time::sleep(Duration::from_secs(17)).await; // longer than READ_TIMEOUT
+            true
+        }
+    }
+    let release = Arc::new(Notify::new());
+    let pc = pc_with(release.clone(), Some(Arc::new(SlowYes))).await;
+    let phone = member_of(&pc, "iPhone").await;
+    let call = {
+        let (phone, addr) = (phone.clone(), pc.addr());
+        tokio::spawn(async move {
+            phone
+                .call(addr, Request::new("slow.secret", json!({})))
+                .await
+        })
+    };
+    // Let the module finish once approved.
+    tokio::time::sleep(Duration::from_secs(18)).await;
+    release.notify_one();
+    let outcome = tokio::time::timeout(Duration::from_secs(30), call)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(outcome, Ok(Response::Ok { .. })),
+        "got {outcome:?}"
+    );
+}

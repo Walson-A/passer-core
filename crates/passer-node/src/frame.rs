@@ -10,8 +10,10 @@ use serde::de::DeserializeOwned;
 
 /// Largest frame accepted for control messages and calls.
 pub const MAX_FRAME: usize = 1024 * 1024;
-/// How long a peer may take to send a whole frame.
+/// How long a peer may take to send a whole request.
 pub const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long a caller waits for an answer: a human approval alone may take a minute.
+pub const ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
@@ -40,7 +42,15 @@ pub async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Resu
 }
 
 pub async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, FrameError> {
-    tokio::time::timeout(READ_TIMEOUT, read_frame_inner(recv))
+    read_frame_within(recv, READ_TIMEOUT).await
+}
+
+/// Like [`read_frame`], with an explicit time limit (for answers that may wait on a human).
+pub async fn read_frame_within<T: DeserializeOwned>(
+    recv: &mut RecvStream,
+    limit: std::time::Duration,
+) -> Result<T, FrameError> {
+    tokio::time::timeout(limit, read_frame_inner(recv))
         .await
         .map_err(|_| FrameError::Timeout)?
 }
