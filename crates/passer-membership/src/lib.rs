@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 const ENTRY_CONTEXT: &str = "membership/entry/v1";
 /// Longest device name accepted, in bytes.
 pub const MAX_NAME_LEN: usize = 64;
+/// Longest log accepted. Bounds the work any peer or server can ask of a verifier.
+pub const MAX_LOG_ENTRIES: usize = 4096;
 
 /// A 32-byte BLAKE3 digest.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -206,6 +208,10 @@ pub enum MembershipError {
     LastApprover(u64),
     #[error("entry {0}: invalid device name")]
     BadName(u64),
+    #[error("entry {0}: another member already has this name")]
+    NameTaken(u64),
+    #[error("the log is longer than {MAX_LOG_ENTRIES} entries")]
+    TooLong,
     #[error("the update does not extend the log this device already has (fork or rollback)")]
     NotAnExtension,
     #[error("the update belongs to another group")]
@@ -241,12 +247,22 @@ impl DeviceLog {
         &self.entries
     }
 
+    /// The first `n` entries (a genuine, older state of the same log).
+    pub fn prefix(&self, n: usize) -> DeviceLog {
+        DeviceLog {
+            entries: self.entries[..n.min(self.entries.len())].to_vec(),
+        }
+    }
+
     pub fn group_id(&self) -> Option<GroupId> {
         self.entries.first().map(Entry::digest)
     }
 
     /// Verifies the whole chain and returns the resulting membership.
     pub fn verify(&self) -> Result<Membership, MembershipError> {
+        if self.entries.len() > MAX_LOG_ENTRIES {
+            return Err(MembershipError::TooLong);
+        }
         let first = self.entries.first().ok_or(MembershipError::Empty)?;
         let mut state = State::default();
         for (i, entry) in self.entries.iter().enumerate() {
@@ -303,6 +319,81 @@ impl DeviceLog {
         Ok(membership)
     }
 
+    /// Decides which of two logs of the same group should be kept. Both must verify.
+    ///
+    /// When one extends the other, the longer one. When they **fork** (same history up to
+    /// a point, then different signed entries), a deterministic rule that every device and
+    /// server applies alike, so that all converge on the same branch:
+    ///
+    /// 1. **Revocation wins.** If one branch removes a device that wrote entries in the
+    ///    other branch, and not the reverse, it wins. A removed (e.g. stolen) approver
+    ///    cannot keep its own branch alive by publishing it first.
+    /// 2. If both branches revoke each other's authors, or neither does, the branch that
+    ///    keeps more of the approvers present at the fork point wins.
+    /// 3. Then the branch whose first divergent entry comes from the more senior device
+    ///    (added earlier) wins; then the lower entry digest, so the choice is never a tie.
+    ///
+    /// With only two approvers that revoke each other, rule 3 decides; recovery beyond
+    /// that needs a recovery code (not implemented yet).
+    pub fn prefer(&self, other: &DeviceLog) -> Result<Preferred, MembershipError> {
+        let ours_m = self.verify()?;
+        let theirs_m = other.verify()?;
+        if self.group_id() != other.group_id() {
+            return Err(MembershipError::OtherGroup);
+        }
+        let k = self
+            .entries
+            .iter()
+            .zip(&other.entries)
+            .take_while(|(a, b)| a == b)
+            .count();
+        match (k == self.entries.len(), k == other.entries.len()) {
+            (true, true) => return Ok(Preferred::Same),
+            (true, false) => return Ok(Preferred::Theirs),
+            (false, true) => return Ok(Preferred::Ours),
+            (false, false) => {}
+        }
+        let base = DeviceLog {
+            entries: self.entries[..k].to_vec(),
+        }
+        .verify()?;
+        let (ours, theirs) = (&self.entries[k..], &other.entries[k..]);
+        let authors = |branch: &[Entry]| branch.iter().map(|e| e.author).collect::<BTreeSet<_>>();
+        let removed = |branch: &[Entry]| {
+            branch
+                .iter()
+                .filter_map(|e| match &e.op {
+                    Op::Remove { device } => Some(*device),
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        let ours_revokes_theirs = !removed(ours).is_disjoint(&authors(theirs));
+        let theirs_revokes_ours = !removed(theirs).is_disjoint(&authors(ours));
+        match (ours_revokes_theirs, theirs_revokes_ours) {
+            (true, false) => return Ok(Preferred::Ours),
+            (false, true) => return Ok(Preferred::Theirs),
+            _ => {}
+        }
+        let kept = |m: &Membership| base.approvers().filter(|a| m.is_approver(a)).count();
+        match kept(&ours_m).cmp(&kept(&theirs_m)) {
+            std::cmp::Ordering::Greater => return Ok(Preferred::Ours),
+            std::cmp::Ordering::Less => return Ok(Preferred::Theirs),
+            std::cmp::Ordering::Equal => {}
+        }
+        let seniority = |e: &Entry| {
+            base.members
+                .get(&e.author)
+                .map_or(u64::MAX, |m| m.added_at_seq)
+        };
+        let key = |e: &Entry| (seniority(e), e.digest());
+        Ok(if key(&ours[0]) <= key(&theirs[0]) {
+            Preferred::Ours
+        } else {
+            Preferred::Theirs
+        })
+    }
+
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("log serializes")
     }
@@ -325,6 +416,14 @@ impl DeviceLog {
             sig,
         });
     }
+}
+
+/// The outcome of [`DeviceLog::prefer`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Preferred {
+    Ours,
+    Theirs,
+    Same,
 }
 
 #[derive(Default)]
@@ -368,6 +467,9 @@ impl State {
                     return Err(MembershipError::NotAllowed(i));
                 }
                 check_name(name).map_err(|_| MembershipError::BadName(i))?;
+                if self.members.values().any(|m| same_name(&m.name, name)) {
+                    return Err(MembershipError::NameTaken(i));
+                }
                 if self.revoked.contains(device) {
                     return Err(MembershipError::Revoked(i));
                 }
@@ -409,11 +511,40 @@ impl State {
 }
 
 fn check_name(name: &str) -> Result<(), ()> {
-    if name.is_empty() || name.len() > MAX_NAME_LEN || name.chars().any(char::is_control) {
-        Err(())
-    } else {
-        Ok(())
-    }
+    if is_valid_name(name) { Ok(()) } else { Err(()) }
+}
+
+/// A device or group name: 1 to 64 bytes, with no control, invisible or bidirectional
+/// formatting characters (which could make two names look alike or reorder text), and
+/// not only spaces.
+pub fn is_valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NAME_LEN
+        && !name.trim().is_empty()
+        && !name
+            .chars()
+            .any(|c| c.is_control() || is_invisible_or_bidi(c))
+}
+
+fn is_invisible_or_bidi(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
+        | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}'
+        | '\u{FFA0}' | '\u{FFF0}'..='\u{FFFB}' | '\u{E0000}'..='\u{E0FFF}')
+}
+
+/// Two names that a person could take for each other: compared without case, spaces or
+/// punctuation. (Look-alike letters from other scripts are not caught; apps also show a
+/// short device id.)
+pub fn same_name(a: &str, b: &str) -> bool {
+    let key = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    key(a) == key(b)
 }
 
 pub(crate) mod hex_array {
@@ -702,6 +833,204 @@ mod tests {
         let back = DeviceLog::from_json(&log.to_json()).unwrap();
         assert_eq!(back, log);
         assert_eq!(back.verify().unwrap(), log.verify().unwrap());
+    }
+
+    /// The attack found in review: a removed (stolen) approver forks from before its
+    /// removal and publishes first. Whatever order the branches arrive in, every device
+    /// keeps the branch that revokes the thief.
+    #[test]
+    fn a_removed_approver_cannot_win_a_fork() {
+        let (founder, mut base) = group();
+        let thief = Identity::generate();
+        let evil = Identity::generate();
+        base.append(
+            &founder,
+            Op::Add {
+                device: thief.id(),
+                name: "Phone".into(),
+                approver: true,
+            },
+            2,
+        )
+        .unwrap();
+
+        let mut honest = base.clone();
+        honest
+            .append(&founder, Op::Remove { device: thief.id() }, 3)
+            .unwrap();
+
+        let mut fork = base.clone();
+        fork.append(
+            &thief,
+            Op::Add {
+                device: evil.id(),
+                name: "Evil".into(),
+                approver: true,
+            },
+            3,
+        )
+        .unwrap();
+        fork.append(
+            &thief,
+            Op::Remove {
+                device: founder.id(),
+            },
+            4,
+        )
+        .unwrap();
+        assert!(fork.verify().is_ok(), "the fork is valid on its own");
+
+        // Whichever side a device is on, both agree on the honest branch.
+        assert_eq!(honest.prefer(&fork), Ok(Preferred::Ours));
+        assert_eq!(fork.prefer(&honest), Ok(Preferred::Theirs));
+
+        // Same result when the thief's branch does not even remove the founder.
+        let mut quiet = base.clone();
+        quiet
+            .append(
+                &thief,
+                Op::Add {
+                    device: evil.id(),
+                    name: "Evil".into(),
+                    approver: true,
+                },
+                3,
+            )
+            .unwrap();
+        assert_eq!(honest.prefer(&quiet), Ok(Preferred::Ours));
+        assert_eq!(quiet.prefer(&honest), Ok(Preferred::Theirs));
+    }
+
+    #[test]
+    fn concurrent_benign_changes_converge() {
+        let (founder, mut base) = group();
+        let second = Identity::generate();
+        base.append(
+            &founder,
+            Op::Add {
+                device: second.id(),
+                name: "Laptop".into(),
+                approver: true,
+            },
+            2,
+        )
+        .unwrap();
+        let (x, y) = (Identity::generate(), Identity::generate());
+        let mut a = base.clone();
+        a.append(
+            &founder,
+            Op::Add {
+                device: x.id(),
+                name: "X".into(),
+                approver: false,
+            },
+            3,
+        )
+        .unwrap();
+        let mut b = base.clone();
+        b.append(
+            &second,
+            Op::Add {
+                device: y.id(),
+                name: "Y".into(),
+                approver: false,
+            },
+            3,
+        )
+        .unwrap();
+        // Deterministic and antisymmetric: both sides pick the same branch (the founder's).
+        assert_eq!(a.prefer(&b), Ok(Preferred::Ours));
+        assert_eq!(b.prefer(&a), Ok(Preferred::Theirs));
+        assert_eq!(a.prefer(&a.clone()), Ok(Preferred::Same));
+        assert_eq!(base.prefer(&a), Ok(Preferred::Theirs));
+        assert_eq!(a.prefer(&base), Ok(Preferred::Ours));
+    }
+
+    #[test]
+    fn mutual_removal_keeps_the_branch_with_more_approvers() {
+        let (founder, mut base) = group();
+        let laptop = Identity::generate();
+        let thief = Identity::generate();
+        base.append(
+            &founder,
+            Op::Add {
+                device: laptop.id(),
+                name: "Laptop".into(),
+                approver: true,
+            },
+            2,
+        )
+        .unwrap();
+        base.append(
+            &founder,
+            Op::Add {
+                device: thief.id(),
+                name: "Phone".into(),
+                approver: true,
+            },
+            3,
+        )
+        .unwrap();
+        let mut honest = base.clone();
+        honest
+            .append(&laptop, Op::Remove { device: thief.id() }, 4)
+            .unwrap();
+        let mut fork = base.clone();
+        fork.append(
+            &thief,
+            Op::Remove {
+                device: laptop.id(),
+            },
+            4,
+        )
+        .unwrap();
+        fork.append(
+            &thief,
+            Op::Remove {
+                device: founder.id(),
+            },
+            5,
+        )
+        .unwrap();
+        assert_eq!(honest.prefer(&fork), Ok(Preferred::Ours));
+        assert_eq!(fork.prefer(&honest), Ok(Preferred::Theirs));
+    }
+
+    #[test]
+    fn look_alike_and_invisible_names_are_refused() {
+        let (founder, mut log) = group(); // the founder is "PC"
+        for name in ["PC", "pc", " P-C ", "P.C"] {
+            let d = Identity::generate();
+            assert_eq!(
+                log.append(
+                    &founder,
+                    Op::Add {
+                        device: d.id(),
+                        name: name.into(),
+                        approver: false
+                    },
+                    2
+                ),
+                Err(MembershipError::NameTaken(1)),
+                "{name:?}"
+            );
+        }
+        for name in ["PC\u{202E}", "P\u{200B}C", "\u{FEFF}Phone", "   "] {
+            let d = Identity::generate();
+            assert_eq!(
+                log.append(
+                    &founder,
+                    Op::Add {
+                        device: d.id(),
+                        name: name.into(),
+                        approver: false
+                    },
+                    2
+                ),
+                Err(MembershipError::BadName(1)),
+                "{name:?}"
+            );
+        }
     }
 
     #[test]

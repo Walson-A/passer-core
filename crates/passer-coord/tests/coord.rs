@@ -106,12 +106,12 @@ async fn a_stranger_learns_nothing_about_a_group() {
 }
 
 #[tokio::test]
-async fn a_forked_history_is_refused() {
+async fn concurrent_histories_converge() {
     let (server, pc, _phone) = setup().await;
     sync(&pc, server.addr()).await.unwrap(); // stored: genesis, add iPhone
 
-    // A second history from the same genesis, validly signed by the founder (as if its key
-    // had been copied): genesis, add "Other". The server keeps the history it has.
+    // A second history from the same genesis, also signed by the founder: genesis, add
+    // "Other". Every party must end up with the same branch.
     let honest = pc.group().log();
     let mut v: serde_json::Value = serde_json::from_str(&honest.to_json()).unwrap();
     v["entries"].as_array_mut().unwrap().truncate(1);
@@ -127,9 +127,71 @@ async fn a_forked_history_is_refused() {
         now_secs(),
     )
     .unwrap();
-    assert!(fork.verify().is_ok(), "the fork is valid on its own");
-
+    let expected = match honest.prefer(&fork).unwrap() {
+        passer_membership::Preferred::Theirs => fork.clone(),
+        _ => honest.clone(),
+    };
     let forked = node_from(other, fork, "Other").await;
-    let err = sync(&forked, server.addr()).await.unwrap_err();
-    assert!(err.to_string().contains("conflicts"), "{err}");
+    let forked_sync = sync(&forked, server.addr()).await;
+    sync(&pc, server.addr()).await.unwrap();
+    // Server and PC agree on the branch the rule picks, whichever arrived first.
+    assert_eq!(pc.group().log(), expected);
+    if expected == honest {
+        // "Other" is not a member of the winning branch: it learns nothing.
+        assert!(forked_sync.is_err());
+    } else {
+        assert_eq!(forked.group().log(), expected);
+    }
+}
+
+/// The attack found in review, end to end: an approver phone is stolen and removed, but
+/// the thief publishes a fork (made before the removal) first. The server and the other
+/// devices still end up on the branch that removes the thief.
+#[tokio::test]
+async fn a_stolen_approver_cannot_take_over_through_the_server() {
+    let server = Server::spawn(&Identity::generate(), 0).await.unwrap();
+    let pc_id = Identity::generate();
+    let log = DeviceLog::create(&pc_id, "Walson", "PC", now_secs()).unwrap();
+    let pc = node_from(pc_id, log, "PC").await;
+    let thief_inv = pc.invite_approver(300).unwrap();
+    let thief_id = Identity::generate();
+    let (thief_log, _) = join(&thief_id, &thief_inv, "Phone", Network::LocalOnly)
+        .await
+        .unwrap();
+    let laptop = joined(&pc, "Laptop").await;
+    sync(&laptop, server.addr()).await.unwrap();
+
+    // The thief's fork: from its copy of the log, add an accomplice, remove the PC.
+    let mut fork = thief_log;
+    let accomplice = Identity::generate();
+    fork.append(
+        &thief_id,
+        passer_membership::Op::Add {
+            device: accomplice.id(),
+            name: "Evil".into(),
+            approver: true,
+        },
+        now_secs(),
+    )
+    .unwrap();
+    fork.append(
+        &thief_id,
+        passer_membership::Op::Remove { device: pc.id() },
+        now_secs(),
+    )
+    .unwrap();
+    let thief = node_from(thief_id, fork, "Phone").await;
+    sync(&thief, server.addr()).await.unwrap(); // published first
+
+    // The owner removes the phone from the PC, then publishes.
+    pc.remove(thief.id()).unwrap();
+    sync(&pc, server.addr()).await.unwrap();
+
+    // The laptop converges on the owner's branch; the thief is told it was removed.
+    sync(&laptop, server.addr()).await.unwrap();
+    let m = laptop.group().membership();
+    assert!(m.is_member(&pc.id()));
+    assert!(!m.is_member(&thief.id()));
+    assert!(m.members.values().all(|x| x.name != "Evil"));
+    assert!(sync(&thief, server.addr()).await.unwrap().removed);
 }

@@ -66,3 +66,19 @@ jobs:
         run: |
           cargo install cargo-ndk --locked
           cargo ndk --target ${{ matrix.target }} --platform 24 build -p passer-ffi --release
+
+  fuzz:
+    # A short fuzzing run on every push; run longer locally with `cargo +nightly fuzz run <target>`.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [invitation_link, device_log, wire_messages]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60

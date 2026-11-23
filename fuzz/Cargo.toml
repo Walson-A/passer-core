@@ -1,0 +1,36 @@
+[package]
+name = "passer-core-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+passer-identity = { path = "../crates/passer-identity" }
+passer-membership = { path = "../crates/passer-membership" }
+passer-bus = { path = "../crates/passer-bus" }
+serde_json = "1"
+
+[[bin]]
+name = "invitation_link"
+path = "fuzz_targets/invitation_link.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "device_log"
+path = "fuzz_targets/device_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_messages"
+path = "fuzz_targets/wire_messages.rs"
+test = false
+doc = false
+bench = false

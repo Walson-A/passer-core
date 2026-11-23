@@ -12,6 +12,7 @@
 //! approve itself. Names shown in a prompt come from the approver's own copy of the
 //! membership log, never from the message.
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -45,6 +46,21 @@ pub struct ApprovalPrompt {
     /// What the capability acts on (an app, a folder), if anything.
     pub target: Option<String>,
     pub lease_secs: u64,
+}
+
+impl ApprovalPrompt {
+    /// Strips control, invisible and bidirectional characters and bounds every string,
+    /// since most of them come from another device.
+    fn sanitized(mut self) -> Self {
+        use passer_bus::printable;
+        self.requester_name = printable(&self.requester_name, 64);
+        self.agent = self.agent.map(|a| printable(&a, 64));
+        self.target_device_name = printable(&self.target_device_name, 64);
+        self.capability = printable(&self.capability, 96);
+        self.title = printable(&self.title, 128);
+        self.target = self.target.map(|t| printable(&t, 256));
+        self
+    }
 }
 
 /// Shows a prompt to the person in front of this device and returns their answer.
@@ -87,11 +103,60 @@ fn name_of(group: &Group, device: &DeviceId) -> Option<String> {
 pub struct ApprovalModule {
     group: Arc<Group>,
     prompter: Arc<dyn Prompter>,
+    limits: std::sync::Mutex<HashMap<DeviceId, Budget>>,
 }
+
+/// How many prompts one device may cause: one at a time, and a few per minute.
+#[derive(Default)]
+struct Budget {
+    pending: bool,
+    window_start: u64,
+    count: u32,
+}
+
+struct Release<'a> {
+    module: &'a ApprovalModule,
+    device: DeviceId,
+}
+
+impl Drop for Release<'_> {
+    fn drop(&mut self) {
+        self.module.release(self.device);
+    }
+}
+
+/// Prompts per device per minute.
+pub const PROMPTS_PER_MINUTE: u32 = 6;
 
 impl ApprovalModule {
     pub fn new(group: Arc<Group>, prompter: Arc<dyn Prompter>) -> Self {
-        Self { group, prompter }
+        Self {
+            group,
+            prompter,
+            limits: Default::default(),
+        }
+    }
+
+    fn take_budget(&self, device: DeviceId) -> bool {
+        let now = crate::now_secs();
+        let mut limits = self.limits.lock().expect("limits lock");
+        let b = limits.entry(device).or_default();
+        if now.saturating_sub(b.window_start) >= 60 {
+            b.window_start = now;
+            b.count = 0;
+        }
+        if b.pending || b.count >= PROMPTS_PER_MINUTE {
+            return false;
+        }
+        b.pending = true;
+        b.count += 1;
+        true
+    }
+
+    fn release(&self, device: DeviceId) {
+        if let Some(b) = self.limits.lock().expect("limits lock").get_mut(&device) {
+            b.pending = false;
+        }
     }
 }
 
@@ -152,6 +217,18 @@ impl Module for ApprovalModule {
             title: req.title,
             target: req.target,
             lease_secs: req.lease_secs,
+        }
+        .sanitized();
+        let asker = ctx.subject.device;
+        if !self.take_budget(asker) {
+            return Err(ModuleError::Failed(
+                "too many approval requests from this device; try again later".into(),
+            ));
+        }
+        // Released even if the call is cancelled mid-prompt.
+        let _guard = Release {
+            module: self,
+            device: asker,
         };
         let approved = self.prompter.ask(&prompt).await;
         Ok(json!({ "approved": approved }))
@@ -205,7 +282,8 @@ impl Approver for RemoteApprover {
                 title: request.capability.title.clone(),
                 target: request.target.clone(),
                 lease_secs: request.lease_secs,
-            };
+            }
+            .sanitized();
             let local = local.clone();
             answers.spawn(async move { Some(local.ask(&prompt).await) });
         }

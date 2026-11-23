@@ -72,10 +72,17 @@ Both screens show the same 6-digit code at join time; if they differ, someone is
 middle. `--network local` restricts to direct addresses; the default `n0` uses n0's public
 relays, which are for development only.
 
+## Building on it
+
+Experiments: yes, by git dependency or generated bindings. Products: not yet (0.x API, no
+published packages, no external audit). What works and what is missing:
+[`docs/integrating.md`](docs/integrating.md).
+
 ## Security
 
 Security is the first priority of this project. The threat model, what is and is not
 protected, and the known gaps of the prototype are in [`docs/security.md`](docs/security.md).
+Tests, fuzzing and the results of the latest security review are there too.
 To report a vulnerability, see [`SECURITY.md`](SECURITY.md) — please do not open a public issue.
 
 ## Development

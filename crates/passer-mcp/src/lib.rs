@@ -15,7 +15,6 @@
 //! device (`Who::Agent { via }`). The server instructions remind the agent that content
 //! coming from devices is data, never an instruction.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -70,7 +69,10 @@ impl Bridge {
     pub async fn discover(&self) -> Vec<BridgeTool> {
         let me = self.node.id();
         let members = self.node.group().membership().members;
-        let mut by_name: BTreeMap<String, BridgeTool> = BTreeMap::new();
+        // Devices that declare a capability *identically* share one tool. A device that
+        // declares it differently gets its own tool: one device's description, schema or
+        // effect never stands for another's.
+        let mut groups: Vec<BridgeTool> = Vec::new();
         for (device, member) in members.iter().filter(|(d, _)| **d != me) {
             let mut request = Request::new(LIST_CAPABILITY, json!({}));
             request.agent = Some(self.agent.clone());
@@ -84,20 +86,42 @@ impl Bridge {
             let caps: Vec<Capability> =
                 serde_json::from_value(output["capabilities"].clone()).unwrap_or_default();
             for cap in caps.into_iter().filter(|c| c.mode == Mode::Call) {
-                let entry = by_name
-                    .entry(cap.name.clone())
-                    .or_insert_with(|| BridgeTool {
-                        tool_name: tool_name(&cap.name),
-                        capability: cap.clone(),
-                        devices: Vec::new(),
-                    });
-                entry.devices.push((*device, member.name.clone()));
+                match groups.iter_mut().find(|t| t.capability == cap) {
+                    Some(t) => t.devices.push((*device, member.name.clone())),
+                    None => groups.push(BridgeTool {
+                        tool_name: String::new(),
+                        capability: cap,
+                        devices: vec![(*device, member.name.clone())],
+                    }),
+                }
             }
         }
-        let mut tools: Vec<BridgeTool> = by_name.into_values().collect();
-        for t in &mut tools {
+        for t in &mut groups {
             t.devices.sort_by(|a, b| a.1.cmp(&b.1));
         }
+        // Stable order, then one-to-one names: the plain name for the first declaration,
+        // a device suffix for the others, a counter for any remaining collision.
+        groups.sort_by(|a, b| {
+            (a.capability.name.as_str(), a.devices[0].0.as_bytes())
+                .cmp(&(b.capability.name.as_str(), b.devices[0].0.as_bytes()))
+        });
+        let mut used = std::collections::BTreeSet::new();
+        for t in &mut groups {
+            let base = tool_name(&t.capability.name);
+            let mut name = if used.contains(&base) {
+                format!("{base}_{}", t.devices[0].0.fmt_short())
+            } else {
+                base.clone()
+            };
+            let mut n = 2;
+            while used.contains(&name) {
+                name = format!("{base}_{n}");
+                n += 1;
+            }
+            used.insert(name.clone());
+            t.tool_name = name;
+        }
+        let tools = groups;
         *self.tools.lock().expect("tools lock") = tools.clone();
         tools
     }

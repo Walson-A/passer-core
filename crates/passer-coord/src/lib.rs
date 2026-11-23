@@ -27,8 +27,8 @@ use iroh::endpoint::{Connection, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr};
 use passer_identity::{DeviceId, Identity};
-use passer_membership::{DeviceLog, GroupId};
-use passer_node::frame::{read_frame, write_frame};
+use passer_membership::{DeviceLog, GroupId, Op, Preferred};
+use passer_node::frame::{READ_TIMEOUT, read_frame, write_frame};
 use passer_node::{Node, now_secs};
 use serde::{Deserialize, Serialize};
 
@@ -76,43 +76,105 @@ struct GroupState {
     presence: HashMap<DeviceId, Presence>,
 }
 
-/// All groups served by one server.
+/// Most groups one server keeps. A hosted service adds accounts and quotas on top.
+pub const MAX_GROUPS: usize = 100_000;
+
+/// All groups served by one server. Each group has its own lock; signature checks run
+/// outside every lock, on blocking threads.
 #[derive(Default, Clone)]
-pub struct State(Arc<Mutex<HashMap<GroupId, GroupState>>>);
+pub struct State(Arc<Mutex<HashMap<GroupId, Arc<Mutex<GroupState>>>>>);
 
 impl State {
-    fn publish(&self, from: DeviceId, msg: Publish, now: u64) -> Reply {
-        let Ok(membership) = msg.log.verify() else {
+    fn group(&self, id: GroupId) -> Option<Arc<Mutex<GroupState>>> {
+        let mut groups = self.0.lock().expect("state lock");
+        if let Some(g) = groups.get(&id) {
+            return Some(g.clone());
+        }
+        if groups.len() >= MAX_GROUPS {
+            return None;
+        }
+        Some(groups.entry(id).or_default().clone())
+    }
+
+    async fn publish(&self, from: DeviceId, msg: Publish, now: u64) -> Reply {
+        // Expensive work (signature checks) first, without any lock.
+        let incoming = msg.log;
+        let Ok(Ok(membership)) = tokio::task::spawn_blocking({
+            let log = incoming.clone();
+            move || log.verify()
+        })
+        .await
+        else {
             return Reply::Error {
                 message: "the log does not verify".into(),
             };
         };
-        let mut groups = self.0.lock().expect("state lock");
-        let group = groups.entry(membership.group).or_default();
-
-        // Keep whichever log extends the other; refuse forks.
-        let stored = match group.log.take() {
-            None => msg.log,
-            Some(stored) => {
-                if stored.accept_update(&msg.log).is_ok() {
-                    msg.log
-                } else if msg.log.accept_update(&stored).is_ok() {
-                    stored
-                } else {
-                    group.log = Some(stored);
-                    return Reply::Error {
-                        message: "the log conflicts with the one already stored".into(),
-                    };
-                }
-            }
+        let Some(group) = self.group(membership.group) else {
+            return Reply::Error {
+                message: "this server cannot take more groups".into(),
+            };
         };
-        let current = stored.verify().expect("stored logs verify");
-        group.log = Some(stored.clone());
 
+        // Decide which history to keep, then store it if nobody changed it meanwhile.
+        let mut chosen = None;
+        for _ in 0..3 {
+            let stored = group.lock().expect("group lock").log.clone();
+            let winner = match stored.clone() {
+                None => incoming.clone(),
+                Some(stored_log) => {
+                    let candidate = incoming.clone();
+                    let preferred =
+                        tokio::task::spawn_blocking(move || stored_log.prefer(&candidate)).await;
+                    match preferred {
+                        Ok(Ok(Preferred::Theirs)) => incoming.clone(),
+                        Ok(Ok(_)) => stored.clone().expect("checked"),
+                        _ => {
+                            return Reply::Error {
+                                message: "the log belongs to another group".into(),
+                            };
+                        }
+                    }
+                }
+            };
+            let mut g = group.lock().expect("group lock");
+            if g.log == stored {
+                g.log = Some(winner.clone());
+                chosen = Some(winner);
+                break;
+            }
+        }
+        let Some(stored) = chosen else {
+            return Reply::Error {
+                message: "busy, try again".into(),
+            };
+        };
+        let current = tokio::task::spawn_blocking({
+            let log = stored.clone();
+            move || log.verify()
+        })
+        .await
+        .ok()
+        .and_then(Result::ok);
+        let Some(current) = current else {
+            return Reply::Error {
+                message: "internal error".into(),
+            };
+        };
+
+        let mut g = group.lock().expect("group lock");
         if !current.is_member(&from) {
-            group.presence.remove(&from);
+            g.presence.remove(&from);
             return if current.revoked.contains(&from) {
-                Reply::Removed { log: stored }
+                // Only the history up to this device's removal: what came after is none
+                // of its business.
+                let cut = stored
+                    .entries()
+                    .iter()
+                    .position(|e| matches!(&e.op, Op::Remove { device } if *device == from))
+                    .map_or(stored.entries().len(), |i| i + 1);
+                Reply::Removed {
+                    log: stored.prefix(cut),
+                }
             } else {
                 Reply::Error {
                     message: "this device is not a member of the group".into(),
@@ -122,7 +184,7 @@ impl State {
 
         let mut addrs = msg.addrs;
         addrs.truncate(MAX_ADDRS);
-        group.presence.insert(
+        g.presence.insert(
             from,
             Presence {
                 device: from,
@@ -130,8 +192,8 @@ impl State {
                 seen_at: now,
             },
         );
-        group.presence.retain(|d, _| current.is_member(d));
-        let presence = group
+        g.presence.retain(|d, _| current.is_member(d));
+        let presence = g
             .presence
             .values()
             .filter(|p| p.device != from && now.saturating_sub(p.seen_at) <= PRESENCE_TTL_SECS)
@@ -163,9 +225,12 @@ impl std::fmt::Debug for CoordProtocol {
 impl ProtocolHandler for CoordProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let from = connection.remote_id();
-        let (mut send, mut recv) = connection.accept_bi().await?;
+        let Ok(opened) = tokio::time::timeout(READ_TIMEOUT, connection.accept_bi()).await else {
+            return Ok(());
+        };
+        let (mut send, mut recv) = opened?;
         let reply = match read_frame::<Publish>(&mut recv).await {
-            Ok(msg) => self.state.publish(from, msg, now_secs()),
+            Ok(msg) => self.state.publish(from, msg, now_secs()).await,
             Err(e) => Reply::Error {
                 message: e.to_string(),
             },
@@ -174,7 +239,7 @@ impl ProtocolHandler for CoordProtocol {
             .await
             .map_err(AcceptError::from_err)?;
         send.finish()?;
-        connection.closed().await;
+        let _ = tokio::time::timeout(READ_TIMEOUT, connection.closed()).await;
         Ok(())
     }
 }

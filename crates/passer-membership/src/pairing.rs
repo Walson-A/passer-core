@@ -60,6 +60,8 @@ pub enum PairingError {
     BadSignature,
     #[error("the inviter is not an approver of this group")]
     NotApprover,
+    #[error("the device name is not acceptable")]
+    BadName,
 }
 
 impl Invitation {
@@ -247,6 +249,11 @@ impl InvitationBook {
         now: u64,
     ) -> Result<Admission, PairingError> {
         self.pending.retain(|inv| inv.expires_at > now);
+        // Check the name before consuming anything, so a bad name does not burn the
+        // invitation. (Uniqueness is checked when the inviter appends to the log.)
+        if !crate::is_valid_name(&request.name) {
+            return Err(PairingError::BadName);
+        }
         if request.device != *authenticated {
             return Err(PairingError::Mismatch);
         }

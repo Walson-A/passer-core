@@ -524,35 +524,40 @@ fn resolve(group: &Group, query: &str) -> anyhow::Result<DeviceId> {
     }
 }
 
-/// Asks the person at this terminal.
+/// Asks the person at this terminal, one prompt at a time, through a single reader.
 struct ConsolePrompter;
+
+static CONSOLE: std::sync::LazyLock<tokio::sync::Mutex<tokio::io::BufReader<tokio::io::Stdin>>> =
+    std::sync::LazyLock::new(|| {
+        tokio::sync::Mutex::new(tokio::io::BufReader::new(tokio::io::stdin()))
+    });
 
 #[async_trait::async_trait]
 impl Prompter for ConsolePrompter {
     async fn ask(&self, p: &ApprovalPrompt) -> bool {
         use tokio::io::AsyncBufReadExt;
+        let mut stdin = CONSOLE.lock().await;
         let who = match &p.agent {
-            Some(agent) => format!("{agent} (through {})", p.requester_name),
-            None => p.requester_name.clone(),
+            Some(agent) => format!(
+                "{agent} (through {} {})",
+                p.requester_name,
+                p.requester.fmt_short()
+            ),
+            None => format!("{} {}", p.requester_name, p.requester.fmt_short()),
         };
         let on = match &p.target {
             Some(t) => format!(" on {t}"),
             None => String::new(),
         };
         println!(
-            "
-{who} asks: {} [{}]{on} on {}, for up to {} min. Allow? [y/N]",
+            "\n{who} asks: {} [{}]{on} on {} {}, for up to {} min. Allow? [y/N]",
             p.title,
             p.capability,
-            if p.target_device_name.is_empty() {
-                "this device"
-            } else {
-                &p.target_device_name
-            },
+            p.target_device_name,
+            p.target_device.fmt_short(),
             p.lease_secs.div_ceil(60)
         );
         let mut line = String::new();
-        let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
         stdin.read_line(&mut line).await.is_ok() && line.trim().eq_ignore_ascii_case("y")
     }
 }

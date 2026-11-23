@@ -158,9 +158,12 @@ pub struct CallerInfo {
 /// What the user is asked to approve.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct ApprovalInfo {
+    /// Show a short form of the ids too: names are unique in a group, ids cannot be faked.
+    pub requester_id: String,
     pub requester_name: String,
     pub agent: Option<String>,
-    /// The device that would act (empty if it is this one).
+    pub target_device_id: String,
+    /// The device that would act.
     pub target_device_name: String,
     pub capability: String,
     pub title: String,
@@ -281,6 +284,8 @@ impl Prompter for ForeignPrompter {
     async fn ask(&self, p: &ApprovalPrompt) -> bool {
         self.0
             .ask(ApprovalInfo {
+                requester_id: p.requester.to_string(),
+                target_device_id: p.target_device.to_string(),
                 requester_name: p.requester_name.clone(),
                 agent: p.agent.clone(),
                 target_device_name: p.target_device_name.clone(),

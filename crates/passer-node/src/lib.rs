@@ -28,7 +28,7 @@ use iroh::{Endpoint, EndpointAddr};
 use passer_bus::{Bus, MembershipView, Request, Response, Subject};
 use passer_identity::{DeviceId, Identity};
 use passer_membership::pairing::{Invitation, InvitationBook, JoinRequest};
-use passer_membership::{DeviceLog, Membership, Op};
+use passer_membership::{DeviceLog, Membership, Op, Preferred};
 use serde::{Deserialize, Serialize};
 
 use crate::frame::{read_frame, write_frame};
@@ -81,13 +81,21 @@ impl Group {
     }
 
     fn save(&self) -> anyhow::Result<()> {
+        let inner = self.inner.read().expect("group lock");
+        self.write_file(&inner.log)
+    }
+
+    /// Writes the log atomically: a unique temporary file, then a rename. Called with the
+    /// group lock held, so writers never interleave.
+    fn write_file(&self, log: &DeviceLog) -> anyhow::Result<()> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if let Some(path) = &self.path {
-            let json = self.inner.read().expect("group lock").log.to_json();
-            let tmp = path.with_extension("tmp");
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&tmp, json)?;
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp = path.with_extension(format!("{}.{n}.tmp", std::process::id()));
+            std::fs::write(&tmp, log.to_json())?;
             std::fs::rename(&tmp, path)?;
         }
         Ok(())
@@ -103,35 +111,59 @@ impl Group {
 
     /// Appends a signed operation; returns the devices that stopped being members.
     pub fn append(&self, author: &Identity, op: Op) -> anyhow::Result<Vec<DeviceId>> {
-        let removed = {
-            let mut inner = self.inner.write().expect("group lock");
-            let mut log = inner.log.clone();
-            log.append(author, op, now_secs())?;
-            let membership = log.verify()?;
-            let removed = removed_between(&inner.membership, &membership);
-            *inner = GroupInner { log, membership };
-            removed
-        };
-        self.save()?;
+        let mut inner = self.inner.write().expect("group lock");
+        let mut log = inner.log.clone();
+        log.append(author, op, now_secs())?;
+        let membership = log.verify()?;
+        self.write_file(&log)?;
+        let removed = removed_between(&inner.membership, &membership);
+        *inner = GroupInner { log, membership };
         Ok(removed)
     }
 
-    /// Adopts a log received from a peer if it signs-extends ours.
-    pub fn update(&self, newer: DeviceLog) -> anyhow::Result<Vec<DeviceId>> {
-        let removed = {
-            let mut inner = self.inner.write().expect("group lock");
-            let membership = inner.log.accept_update(&newer)?;
-            let removed = removed_between(&inner.membership, &membership);
-            *inner = GroupInner {
-                log: newer,
-                membership,
-            };
-            removed
-        };
-        self.save()?;
-        Ok(removed)
+    /// Considers a log received from a peer or a server and keeps whichever of the two the
+    /// fork-choice rule prefers ([`DeviceLog::prefer`]): a longer history, or, on a fork,
+    /// the branch that revokes the other's authors.
+    pub fn adopt(&self, received: DeviceLog) -> anyhow::Result<Adoption> {
+        let mut inner = self.inner.write().expect("group lock");
+        match inner.log.prefer(&received)? {
+            Preferred::Ours | Preferred::Same => Ok(Adoption::default()),
+            Preferred::Theirs => {
+                let forked = !received.entries().starts_with(inner.log.entries());
+                let membership = received.verify()?;
+                self.write_file(&received)?;
+                let removed = removed_between(&inner.membership, &membership);
+                if forked {
+                    tracing::warn!(
+                        "the device log forked; switched to the branch that wins the fork choice"
+                    );
+                }
+                *inner = GroupInner {
+                    log: received,
+                    membership,
+                };
+                Ok(Adoption {
+                    changed: true,
+                    forked,
+                    removed,
+                })
+            }
+        }
     }
 }
+
+/// What [`Group::adopt`] did.
+#[derive(Debug, Default)]
+pub struct Adoption {
+    pub changed: bool,
+    /// Our branch lost a fork: entries written here since the fork point were dropped
+    /// (for instance a device this device had added must be invited again).
+    pub forked: bool,
+    /// Devices that are no longer members.
+    pub removed: Vec<DeviceId>,
+}
+
+impl Group {}
 
 fn removed_between(old: &Membership, new: &Membership) -> Vec<DeviceId> {
     let now: BTreeSet<_> = new.members.keys().collect();
@@ -208,10 +240,32 @@ fn dialable_addr(endpoint: &Endpoint) -> EndpointAddr {
 // Protocol handlers
 // ---------------------------------------------------------------------------------------
 
+/// Open bus connections per remote device, so that removing a device cuts them.
+#[derive(Clone, Default)]
+pub(crate) struct Connections(Arc<Mutex<HashMap<DeviceId, Vec<Connection>>>>);
+
+impl Connections {
+    fn add(&self, device: DeviceId, conn: Connection) {
+        let mut map = self.0.lock().expect("connections lock");
+        let list = map.entry(device).or_default();
+        list.retain(|c| c.close_reason().is_none());
+        list.push(conn);
+    }
+
+    fn close(&self, device: &DeviceId) {
+        if let Some(list) = self.0.lock().expect("connections lock").remove(device) {
+            for c in list {
+                c.close(CLOSE_NOT_MEMBER.into(), b"removed from the group");
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct BusProtocol {
     bus: Arc<Bus>,
     group: Arc<Group>,
+    connections: Connections,
 }
 
 impl std::fmt::Debug for BusProtocol {
@@ -227,6 +281,7 @@ impl ProtocolHandler for BusProtocol {
             connection.close(CLOSE_NOT_MEMBER.into(), b"not a member");
             return Ok(());
         }
+        self.connections.add(remote, connection.clone());
         loop {
             let (mut send, mut recv) = match connection.accept_bi().await {
                 Ok(s) => s,
@@ -269,12 +324,16 @@ impl ProtocolHandler for LogProtocol {
             connection.close(CLOSE_NOT_MEMBER.into(), b"not a member");
             return Ok(());
         }
-        let (mut send, _recv) = connection.accept_bi().await?;
+        let Ok(opened) = tokio::time::timeout(frame::READ_TIMEOUT, connection.accept_bi()).await
+        else {
+            return Ok(());
+        };
+        let (mut send, _recv) = opened?;
         write_frame(&mut send, &self.group.log())
             .await
             .map_err(AcceptError::from_err)?;
         send.finish()?;
-        connection.closed().await;
+        let _ = tokio::time::timeout(frame::READ_TIMEOUT, connection.closed()).await;
         Ok(())
     }
 }
@@ -306,7 +365,11 @@ impl std::fmt::Debug for JoinProtocol {
 impl ProtocolHandler for JoinProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let remote = connection.remote_id();
-        let (mut send, mut recv) = connection.accept_bi().await?;
+        let Ok(opened) = tokio::time::timeout(frame::READ_TIMEOUT, connection.accept_bi()).await
+        else {
+            return Ok(());
+        };
+        let (mut send, mut recv) = opened?;
         let reply = match read_frame::<JoinRequest>(&mut recv).await {
             Err(e) => JoinReply::Error {
                 message: e.to_string(),
@@ -349,7 +412,7 @@ impl ProtocolHandler for JoinProtocol {
             .await
             .map_err(AcceptError::from_err)?;
         send.finish()?;
-        connection.closed().await;
+        let _ = tokio::time::timeout(frame::READ_TIMEOUT, connection.closed()).await;
         Ok(())
     }
 }
@@ -364,10 +427,28 @@ impl ProtocolHandler for JoinProtocol {
 pub struct PeerBook(Arc<RwLock<HashMap<DeviceId, EndpointAddr>>>);
 
 impl PeerBook {
+    /// Adds addresses for a device, keeping the ones already known (at most 8, newest
+    /// first), so that a bad hint cannot erase a good one.
     pub fn remember(&self, addr: EndpointAddr) {
-        if addr.ip_addrs().next().is_some() {
-            self.0.write().expect("peers lock").insert(addr.id, addr);
+        let new: Vec<SocketAddr> = addr.ip_addrs().copied().collect();
+        if new.is_empty() {
+            return;
         }
+        let mut map = self.0.write().expect("peers lock");
+        let mut merged = new;
+        if let Some(old) = map.get(&addr.id) {
+            for a in old.ip_addrs() {
+                if !merged.contains(a) {
+                    merged.push(*a);
+                }
+            }
+        }
+        merged.truncate(8);
+        let mut entry = EndpointAddr::new(addr.id);
+        for a in merged {
+            entry = entry.with_ip_addr(a);
+        }
+        map.insert(addr.id, entry);
     }
 
     pub fn addr_of(&self, device: &DeviceId) -> EndpointAddr {
@@ -429,6 +510,7 @@ pub struct Node {
     bus: Arc<Bus>,
     book: Arc<Mutex<InvitationBook>>,
     peers: PeerBook,
+    connections: Connections,
     router: Router,
 }
 
@@ -458,12 +540,14 @@ impl Node {
             });
         }
         let book = Arc::new(Mutex::new(InvitationBook::default()));
+        let connections = Connections::default();
         let router = Router::builder(endpoint)
             .accept(
                 BUS_ALPN,
                 BusProtocol {
                     bus: bus.clone(),
                     group: group.clone(),
+                    connections: connections.clone(),
                 },
             )
             .accept(
@@ -488,6 +572,7 @@ impl Node {
             bus,
             book,
             peers,
+            connections,
             router,
         })
     }
@@ -583,14 +668,8 @@ impl Node {
     /// - a prefix of ours (the sender is behind): ignored;
     /// - anything else (another group, a fork, a forgery): refused.
     pub fn adopt_log(&self, log: DeviceLog) -> anyhow::Result<Membership> {
-        let ours = self.group.log();
-        if ours.accept_update(&log).is_ok() {
-            let removed = self.group.update(log)?;
-            self.revoke(&removed);
-        } else {
-            log.accept_update(&ours)
-                .context("the received log conflicts with ours")?;
-        }
+        let adoption = self.group.adopt(log)?;
+        self.revoke(&adoption.removed);
         Ok(self.group.membership())
     }
 
@@ -609,6 +688,7 @@ impl Node {
     fn revoke(&self, removed: &[DeviceId]) {
         for d in removed {
             self.bus.leases().revoke_device(d, "removed from the group");
+            self.connections.close(d);
         }
     }
 

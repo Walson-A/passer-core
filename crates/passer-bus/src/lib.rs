@@ -264,7 +264,7 @@ impl Bus {
     pub async fn handle(&self, subject: Subject, request: Request) -> Response {
         let mut event = Event {
             device: subject.device.to_string(),
-            agent: subject.agent.clone(),
+            agent: subject.agent.as_deref().map(|a| truncate(a, 64)),
             capability: truncate(&request.capability, 96),
             target: request
                 .target
@@ -290,6 +290,13 @@ impl Bus {
                 ErrorCode::NotMember,
                 "this device is not a member of the group",
             );
+        }
+        if subject
+            .agent
+            .as_deref()
+            .is_some_and(|a| !valid_agent_name(a))
+        {
+            return Response::error(ErrorCode::InvalidInput, "invalid agent name");
         }
         if request.capability == LIST_CAPABILITY {
             event.decision = "allow".into();
@@ -387,6 +394,13 @@ impl Bus {
             IndicatorRequirement::None => None,
         };
 
+        // An approval can take a minute: the device may have been removed meanwhile.
+        if !self.members.is_member(&subject.device) {
+            return Response::error(
+                ErrorCode::NotMember,
+                "this device is no longer a member of the group",
+            );
+        }
         let lease = self.leases.grant(
             subject.clone(),
             &cap.name,
@@ -429,15 +443,43 @@ impl Bus {
     }
 }
 
+/// Bounded and printable: strings from the network reach journals, terminals and UIs.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_owned();
+    let mut out = String::with_capacity(s.len().min(max));
+    for c in s.chars() {
+        let c = if c.is_control() || is_format_char(c) {
+            '?'
+        } else {
+            c
+        };
+        if out.len() + c.len_utf8() > max {
+            break;
+        }
+        out.push(c);
     }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_owned()
+    out
+}
+
+/// Invisible and bidirectional formatting characters.
+pub fn is_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E0FFF}')
+}
+
+/// An agent name: 1 to 64 characters among letters, digits, `.`, `_`, `-`.
+pub fn valid_agent_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Makes a network-provided string safe to show: no control, invisible or bidirectional
+/// characters, at most `max` bytes.
+pub fn printable(s: &str, max: usize) -> String {
+    truncate(s, max)
 }
 
 #[cfg(test)]

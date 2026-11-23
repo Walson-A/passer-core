@@ -40,6 +40,14 @@ Rules: a removed key is revoked forever; the last approver cannot be removed; na
 re-signed, reordered or edited entry is rejected. `accept_update()` adopts a received log
 only if it extends the one already held (refusing rollbacks and forks).
 
+**Forks.** Two valid branches can exist (two approvers writing at once, or a removed
+approver publishing a branch made before its removal). `DeviceLog::prefer` picks one, the
+same way on every device and on the server: revocation wins (a branch that removes the
+other branch's authors), then the branch keeping more approvers from the fork point, then
+the more senior device, then the lower digest. Names must be unique in a group (ignoring
+case, spaces and punctuation) and free of invisible or bidirectional characters. Logs are
+capped at 4096 entries.
+
 **Consequence:** whoever stores and relays the log — a coordination server, another device
 — cannot add a device. It has no approver key to sign with.
 

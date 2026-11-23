@@ -21,5 +21,6 @@ async-trait = "0.1"
 jsonschema = { version = "0.63", default-features = false }
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }

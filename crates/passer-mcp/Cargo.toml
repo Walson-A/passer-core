@@ -20,4 +20,5 @@ tracing = { workspace = true }
 [dev-dependencies]
 passer-membership = { path = "../passer-membership" }
 passer-device-info = { path = "../passer-device-info" }
+async-trait = "0.1"
 rmcp = { version = "3.11", features = ["server", "client", "transport-io"] }

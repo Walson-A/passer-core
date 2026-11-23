@@ -103,6 +103,8 @@ pub struct Verdict {
 
 /// Default session length.
 pub const DEFAULT_LEASE_SECS: u64 = 10 * 60;
+/// No session ever lasts longer than this (a day).
+pub const MAX_LEASE_SECS: u64 = 24 * 3600;
 /// No session on a sensitive capability ever lasts longer than this.
 pub const MAX_SENSITIVE_LEASE_SECS: u64 = 15 * 60;
 
@@ -139,8 +141,9 @@ impl Policy {
         let lease_secs = if effect == Effect::Sensitive {
             lease.min(MAX_SENSITIVE_LEASE_SECS)
         } else {
-            lease
-        };
+            lease.min(MAX_LEASE_SECS)
+        }
+        .max(1);
         Verdict {
             decision,
             lease_secs,
