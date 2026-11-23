@@ -192,7 +192,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let home = Home::resolve(cli.home)?;
     let network: Network = cli.network.into();
-    let coord = cli.coord.as_deref().map(parse_coord).transpose()?;
+    let coord = cli
+        .coord
+        .as_deref()
+        .map(passer_coord::parse_server)
+        .transpose()?;
     let identity = platform_store(home.key()).load_or_create()?;
 
     match cli.command {
@@ -499,17 +503,6 @@ async fn client(
         peer = peer.with_ip_addr(a.parse().with_context(|| format!("bad address {a}"))?);
     }
     Ok((node, peer))
-}
-
-/// Parses `<id>@<ip:port>[,<ip:port>...]`.
-fn parse_coord(s: &str) -> anyhow::Result<EndpointAddr> {
-    let (id, addrs) = s.split_once('@').unwrap_or((s, ""));
-    let id: DeviceId = id.parse().context("bad coordination server id")?;
-    let mut addr = EndpointAddr::new(id);
-    for a in addrs.split(',').filter(|a| !a.is_empty()) {
-        addr = addr.with_ip_addr(a.parse().with_context(|| format!("bad address {a}"))?);
-    }
-    Ok(addr)
 }
 
 /// Finds a member by exact name or by a prefix of its id.

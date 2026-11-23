@@ -1,0 +1,31 @@
+[package]
+name = "passer-ffi"
+description = "passer-core for apps: one device object, exposed to Swift (iOS, macOS) and Kotlin (Android) through UniFFI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[lib]
+# lib: Rust users and tests. cdylib: Android and binding generation. staticlib: iOS.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+passer-identity = { path = "../passer-identity" }
+passer-membership = { path = "../passer-membership" }
+passer-bus = { path = "../passer-bus" }
+passer-node = { path = "../passer-node" }
+passer-coord = { path = "../passer-coord" }
+passer-device-info = { path = "../passer-device-info" }
+iroh = { workspace = true }
+uniffi = { version = "0.32", features = ["tokio"] }
+async-trait = "0.1"
+tokio = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,4 +23,46 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    # The desktop platforms Passer ships on.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+
+  mobile:
+    # The mobile library must keep compiling for phones, even before the apps use it.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-ios
+          - os: macos-latest
+            target: aarch64-apple-ios-sim
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build for iOS
+        if: contains(matrix.target, 'apple-ios')
+        run: cargo build -p passer-ffi --release --target ${{ matrix.target }}
+      - name: Build for Android
+        if: contains(matrix.target, 'android')
+        run: |
+          cargo install cargo-ndk --locked
+          cargo ndk --target ${{ matrix.target }} --platform 24 build -p passer-ffi --release

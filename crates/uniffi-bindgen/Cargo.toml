@@ -1,0 +1,11 @@
+[package]
+name = "uniffi-bindgen"
+description = "Generates the Swift and Kotlin bindings of passer-ffi."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+uniffi = { version = "0.32", features = ["cli"] }

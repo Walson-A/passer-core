@@ -238,6 +238,18 @@ impl Server {
     }
 }
 
+/// Parses a server address written as `<id>@<ip:port>[,<ip:port>...]` (or just `<id>`).
+pub fn parse_server(s: &str) -> anyhow::Result<EndpointAddr> {
+    use anyhow::Context;
+    let (id, addrs) = s.split_once('@').unwrap_or((s, ""));
+    let id: DeviceId = id.parse().context("bad coordination server id")?;
+    let mut addr = EndpointAddr::new(id);
+    for a in addrs.split(',').filter(|a| !a.is_empty()) {
+        addr = addr.with_ip_addr(a.parse().with_context(|| format!("bad address {a}"))?);
+    }
+    Ok(addr)
+}
+
 /// What a device learned from one exchange with the server.
 #[derive(Debug)]
 pub struct SyncOutcome {
