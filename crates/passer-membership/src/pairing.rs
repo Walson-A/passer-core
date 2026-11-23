@@ -1,0 +1,392 @@
+//! Pairing: how a new device joins a group.
+//!
+//! 1. An approver issues an [`Invitation`]: a one-time 32-byte secret, valid a few
+//!    minutes, shown as a QR code or link ([`Invitation::to_link`]). The link carries the
+//!    secret, so it must not be shared or screenshotted.
+//! 2. The new device builds a [`JoinRequest`]: its public key and name, a MAC keyed by the
+//!    secret (proving it saw the invitation) and a signature by its own key (proving it
+//!    holds that key). It sends the request to the inviter over the transport, which
+//!    already authenticates the same key.
+//! 3. The inviter redeems it through its [`InvitationBook`]: secret matched in constant
+//!    time, not expired, never used before, key authenticated by the transport. It then
+//!    appends a signed `Add` to the log. The server never sees the secret.
+//! 4. Both screens can show [`sas_code`], a 6-digit code derived from the secret and both
+//!    keys. If the codes differ, someone is in the middle: cancel.
+//!
+//! A password-authenticated key exchange (SPAKE2) can replace the MAC later, so that a
+//! short typed code is enough; the QR path does not need it.
+
+use std::collections::HashMap;
+
+use passer_identity::{DeviceId, Identity, Signature, verify};
+use serde::{Deserialize, Serialize};
+
+use crate::{Digest, GroupId};
+
+const JOIN_CONTEXT: &str = "membership/join/v1";
+const LINK_PREFIX: &str = "passer-core://join?";
+
+/// Invitations live at most this long.
+pub const MAX_TTL_SECS: u64 = 15 * 60;
+
+/// An offer, from an approver, to add one device to the group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Invitation {
+    pub group: GroupId,
+    pub inviter: DeviceId,
+    pub secret: [u8; 32],
+    pub expires_at: u64,
+    /// Where the inviter can be reached directly (`ip:port`), for the local network.
+    pub addrs: Vec<String>,
+}
+
+/// Errors while pairing.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PairingError {
+    #[error("not a passer-core join link")]
+    BadLink,
+    #[error("this link uses a newer format; update the app")]
+    UnsupportedVersion,
+    #[error("no pending invitation matches this request")]
+    UnknownInvitation,
+    #[error("the invitation has expired")]
+    Expired,
+    #[error("the request does not match the invitation")]
+    Mismatch,
+    #[error("the request is not signed by the connecting device")]
+    BadSignature,
+    #[error("the inviter is not an approver of this group")]
+    NotApprover,
+}
+
+impl Invitation {
+    pub fn new(
+        group: GroupId,
+        inviter: DeviceId,
+        ttl_secs: u64,
+        now: u64,
+        addrs: Vec<String>,
+    ) -> Self {
+        let mut secret = [0u8; 32];
+        rand::fill(&mut secret);
+        Self {
+            group,
+            inviter,
+            secret,
+            expires_at: now + ttl_secs.min(MAX_TTL_SECS),
+            addrs,
+        }
+    }
+
+    /// The link to show as a QR code. It contains the secret.
+    pub fn to_link(&self) -> String {
+        let mut link = format!(
+            "{LINK_PREFIX}v=1&g={}&i={}&s={}&e={}",
+            self.group,
+            self.inviter,
+            hex::encode(self.secret),
+            self.expires_at
+        );
+        if !self.addrs.is_empty() {
+            link.push_str("&a=");
+            link.push_str(&self.addrs.join(","));
+        }
+        link
+    }
+
+    /// Parses a link. Unknown parameters are ignored; a newer major version is refused.
+    pub fn parse_link(link: &str) -> Result<Self, PairingError> {
+        let query = link
+            .strip_prefix(LINK_PREFIX)
+            .ok_or(PairingError::BadLink)?;
+        let mut params: HashMap<&str, &str> = HashMap::new();
+        for pair in query.split('&') {
+            let (k, v) = pair.split_once('=').ok_or(PairingError::BadLink)?;
+            params.insert(k, v);
+        }
+        match params.get("v") {
+            Some(&"1") => {}
+            Some(_) => return Err(PairingError::UnsupportedVersion),
+            None => return Err(PairingError::BadLink),
+        }
+        let hex32 = |key: &str| -> Result<[u8; 32], PairingError> {
+            let raw = hex::decode(params.get(key).ok_or(PairingError::BadLink)?)
+                .map_err(|_| PairingError::BadLink)?;
+            raw.try_into().map_err(|_| PairingError::BadLink)
+        };
+        let inviter: DeviceId = params
+            .get("i")
+            .ok_or(PairingError::BadLink)?
+            .parse()
+            .map_err(|_| PairingError::BadLink)?;
+        let expires_at = params
+            .get("e")
+            .ok_or(PairingError::BadLink)?
+            .parse()
+            .map_err(|_| PairingError::BadLink)?;
+        let addrs = params
+            .get("a")
+            .map(|a| {
+                a.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            group: Digest(hex32("g")?),
+            inviter,
+            secret: hex32("s")?,
+            expires_at,
+            addrs,
+        })
+    }
+
+    fn mac(&self, device: &DeviceId, name: &str) -> blake3::Hash {
+        blake3::keyed_hash(
+            &self.secret,
+            &join_bytes(&self.group, &self.inviter, device, name),
+        )
+    }
+}
+
+/// What a joining device sends to the inviter.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinRequest {
+    pub group: GroupId,
+    pub inviter: DeviceId,
+    pub device: DeviceId,
+    pub name: String,
+    #[serde(with = "crate::hex_array")]
+    pub mac: [u8; 32],
+    #[serde(with = "crate::hex_sig")]
+    pub sig: Signature,
+}
+
+impl JoinRequest {
+    pub fn new(joiner: &Identity, invitation: &Invitation, name: &str) -> Self {
+        let device = joiner.id();
+        let bytes = join_bytes(&invitation.group, &invitation.inviter, &device, name);
+        Self {
+            group: invitation.group,
+            inviter: invitation.inviter,
+            device,
+            name: name.to_owned(),
+            mac: *invitation.mac(&device, name).as_bytes(),
+            sig: joiner.sign(JOIN_CONTEXT, &bytes),
+        }
+    }
+}
+
+fn join_bytes(group: &GroupId, inviter: &DeviceId, device: &DeviceId, name: &str) -> Vec<u8> {
+    let mut b = Vec::with_capacity(100 + name.len());
+    b.extend_from_slice(&group.0);
+    b.extend_from_slice(inviter.as_bytes());
+    b.extend_from_slice(device.as_bytes());
+    b.extend_from_slice(&(name.len() as u32).to_be_bytes());
+    b.extend_from_slice(name.as_bytes());
+    b
+}
+
+/// Six digits both devices can display, to compare by eye.
+pub fn sas_code(secret: &[u8; 32], inviter: &DeviceId, joiner: &DeviceId) -> String {
+    let mut data = Vec::with_capacity(72);
+    data.extend_from_slice(b"sas/v1");
+    data.extend_from_slice(inviter.as_bytes());
+    data.extend_from_slice(joiner.as_bytes());
+    let h = blake3::keyed_hash(secret, &data);
+    let n = u32::from_be_bytes(h.as_bytes()[..4].try_into().expect("4 bytes")) % 1_000_000;
+    format!("{n:06}")
+}
+
+/// The invitations an approver has issued and not yet seen redeemed.
+#[derive(Default)]
+pub struct InvitationBook {
+    pending: Vec<Invitation>,
+}
+
+/// A redeemed invitation: who joins, and the code to show.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Admission {
+    pub device: DeviceId,
+    pub name: String,
+    pub sas: String,
+}
+
+impl InvitationBook {
+    pub fn issue(&mut self, invitation: Invitation) {
+        self.pending.push(invitation);
+    }
+
+    pub fn pending(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Checks a join request. `authenticated` is the key the transport proved the remote
+    /// holds. On success the invitation is consumed: a second use fails.
+    pub fn redeem(
+        &mut self,
+        request: &JoinRequest,
+        authenticated: &DeviceId,
+        now: u64,
+    ) -> Result<Admission, PairingError> {
+        self.pending.retain(|inv| inv.expires_at > now);
+        if request.device != *authenticated {
+            return Err(PairingError::Mismatch);
+        }
+        let bytes = join_bytes(
+            &request.group,
+            &request.inviter,
+            &request.device,
+            &request.name,
+        );
+        verify(&request.device, JOIN_CONTEXT, &bytes, &request.sig)
+            .map_err(|_| PairingError::BadSignature)?;
+        let expected = blake3::Hash::from_bytes(request.mac);
+        let index = self
+            .pending
+            .iter()
+            .position(|inv| {
+                // blake3::Hash compares in constant time.
+                inv.group == request.group
+                    && inv.inviter == request.inviter
+                    && inv.mac(&request.device, &request.name) == expected
+            })
+            .ok_or(PairingError::UnknownInvitation)?;
+        let inv = self.pending.remove(index);
+        Ok(Admission {
+            device: request.device,
+            name: request.name.clone(),
+            sas: sas_code(&inv.secret, &inv.inviter, &request.device),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DeviceLog, Op};
+
+    fn setup() -> (Identity, DeviceLog, Invitation, InvitationBook) {
+        let pc = Identity::generate();
+        let log = DeviceLog::create(&pc, "Walson", "PC", 100).unwrap();
+        let inv = Invitation::new(
+            log.group_id().unwrap(),
+            pc.id(),
+            300,
+            100,
+            vec!["192.168.1.10:4433".into()],
+        );
+        let mut book = InvitationBook::default();
+        book.issue(inv.clone());
+        (pc, log, inv, book)
+    }
+
+    #[test]
+    fn link_roundtrip() {
+        let (_, _, inv, _) = setup();
+        assert_eq!(Invitation::parse_link(&inv.to_link()).unwrap(), inv);
+        let newer = inv.to_link().replace("v=1", "v=2");
+        assert_eq!(
+            Invitation::parse_link(&newer),
+            Err(PairingError::UnsupportedVersion)
+        );
+        assert_eq!(
+            Invitation::parse_link("https://example.com"),
+            Err(PairingError::BadLink)
+        );
+    }
+
+    #[test]
+    fn full_join_then_log_append() {
+        let (pc, mut log, inv, mut book) = setup();
+        let phone = Identity::generate();
+        let scanned = Invitation::parse_link(&inv.to_link()).unwrap();
+        let req = JoinRequest::new(&phone, &scanned, "iPhone");
+        let admission = book.redeem(&req, &phone.id(), 150).unwrap();
+        assert_eq!(
+            admission.sas,
+            sas_code(&scanned.secret, &pc.id(), &phone.id())
+        );
+        log.append(
+            &pc,
+            Op::Add {
+                device: admission.device,
+                name: admission.name,
+                approver: false,
+            },
+            150,
+        )
+        .unwrap();
+        assert!(log.verify().unwrap().is_member(&phone.id()));
+    }
+
+    #[test]
+    fn invitation_is_single_use() {
+        let (_, _, inv, mut book) = setup();
+        let phone = Identity::generate();
+        let req = JoinRequest::new(&phone, &inv, "iPhone");
+        book.redeem(&req, &phone.id(), 150).unwrap();
+        assert_eq!(
+            book.redeem(&req, &phone.id(), 151),
+            Err(PairingError::UnknownInvitation)
+        );
+    }
+
+    #[test]
+    fn expired_invitation_is_refused() {
+        let (_, _, inv, mut book) = setup();
+        let phone = Identity::generate();
+        let req = JoinRequest::new(&phone, &inv, "iPhone");
+        assert_eq!(
+            book.redeem(&req, &phone.id(), 100 + 301),
+            Err(PairingError::UnknownInvitation)
+        );
+    }
+
+    #[test]
+    fn wrong_secret_is_refused() {
+        let (pc, log, _, mut book) = setup();
+        let guessed = Invitation::new(log.group_id().unwrap(), pc.id(), 300, 100, vec![]);
+        let phone = Identity::generate();
+        let req = JoinRequest::new(&phone, &guessed, "iPhone");
+        assert_eq!(
+            book.redeem(&req, &phone.id(), 150),
+            Err(PairingError::UnknownInvitation)
+        );
+    }
+
+    #[test]
+    fn request_must_come_from_its_own_key() {
+        let (_, _, inv, mut book) = setup();
+        let phone = Identity::generate();
+        let attacker = Identity::generate();
+        let req = JoinRequest::new(&phone, &inv, "iPhone");
+        // Someone replays the phone's request from another connection.
+        assert_eq!(
+            book.redeem(&req, &attacker.id(), 150),
+            Err(PairingError::Mismatch)
+        );
+        // Someone swaps the name: the MAC and signature no longer match.
+        let mut renamed = req.clone();
+        renamed.name = "Evil".into();
+        assert_eq!(
+            book.redeem(&renamed, &phone.id(), 150),
+            Err(PairingError::BadSignature)
+        );
+        // The genuine request still works afterwards.
+        assert!(book.redeem(&req, &phone.id(), 150).is_ok());
+    }
+
+    #[test]
+    fn ttl_is_capped() {
+        let inv = Invitation::new(
+            Digest::ZERO,
+            Identity::generate().id(),
+            10 * 3600,
+            0,
+            vec![],
+        );
+        assert_eq!(inv.expires_at, MAX_TTL_SECS);
+    }
+}

@@ -1,0 +1,25 @@
+[package]
+name = "passer-cli"
+description = "Command-line device for passer-core: create a group, invite, join, call."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "passer-core"
+path = "src/main.rs"
+
+[dependencies]
+passer-identity = { path = "../passer-identity" }
+passer-membership = { path = "../passer-membership" }
+passer-bus = { path = "../passer-bus" }
+passer-node = { path = "../passer-node" }
+passer-device-info = { path = "../passer-device-info" }
+iroh = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+directories = "6"

@@ -1,0 +1,16 @@
+[package]
+name = "passer-device-info"
+description = "Example passer-core module: a device describes itself."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+passer-bus = { path = "../passer-bus" }
+serde_json = { workspace = true }
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true }

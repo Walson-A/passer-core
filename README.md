@@ -1,0 +1,61 @@
+# passer-core
+
+**Your devices, talking to each other — securely, directly, and only to each other.**
+
+`passer-core` is the open core of [Passer](https://github.com/Walson-A/Passer): a small Rust
+library that lets the devices of one person recognise each other, connect directly (or
+through a relay that cannot read anything), and ask one another to do things — with a
+permission check, a time-limited session and a local journal on the device that acts.
+
+> Status: **prototype** (0.1). The protocol will change. Do not use it for anything that
+> matters yet. Working name; the final name is not decided.
+
+## What it does
+
+| Layer | Crate | In one sentence |
+|---|---|---|
+| L0 Identity | `passer-identity` | Each device generates its own Ed25519 key; the public key *is* the device. |
+| L1 Membership | `passer-membership` | A signed, hash-chained device log: only an existing approver can add a device, so a server that stores the log **cannot slip one in**. Pairing by one-time invitation link (QR) with a 6-digit check code. |
+| L2 Transport | `passer-node` | [iroh](https://github.com/n0-computer/iroh) QUIC connections dialed by key: local network first, NAT traversal, relay as a fallback. End-to-end encrypted (TLS 1.3, raw public keys). |
+| L3 Capability bus | `passer-bus` | Devices declare capabilities (schema close to MCP tools). Every call goes through **one** checkpoint on the target: membership, input schema, policy (allow / ask / deny), human approval, visible indicator, lease (stop button), journal without content. |
+| Example module | `passer-device-info` | The smallest module: `device.info`. The template for writing one. |
+| CLI | `passer-cli` | `passer-core init / serve --invite / join / call / sync / remove / journal`. |
+
+What is **not** here, on purpose: file transfer (Passer's module), screen capture and
+remote control (a separate project that builds on this one), accounts, billing, the hosted
+service. See [`docs/architecture.md`](docs/architecture.md).
+
+## Try it
+
+```sh
+cargo build --release
+# first device
+passer-core --home ./pc init --group Home --name PC
+passer-core --home ./pc serve --invite            # prints a one-time join link
+# second device (another terminal or machine)
+passer-core --home ./laptop join '<link>' --name Laptop
+passer-core --home ./laptop call PC device.info
+```
+
+Both screens show the same 6-digit code at join time; if they differ, someone is in the
+middle. `--network local` restricts to direct addresses; the default `n0` uses n0's public
+relays, which are for development only.
+
+## Security
+
+Security is the first priority of this project. The threat model, what is and is not
+protected, and the known gaps of the prototype are in [`docs/security.md`](docs/security.md).
+To report a vulnerability, see [`SECURITY.md`](SECURITY.md) — please do not open a public issue.
+
+## Development
+
+```sh
+cargo test --workspace          # unit tests + end-to-end tests over real QUIC connections
+cargo clippy --workspace --all-targets
+cargo fmt --all
+```
+
+## License
+
+Licensed under either of [Apache License 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT)
+at your option. Contributions are accepted under the same terms.
