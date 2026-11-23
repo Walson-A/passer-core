@@ -107,6 +107,10 @@ async fn a_stranger_learns_nothing_about_a_group() {
 
 #[tokio::test]
 async fn concurrent_histories_converge() {
+    concurrent_histories_converge_body().await;
+}
+
+async fn concurrent_histories_converge_body() {
     let (server, pc, _phone) = setup().await;
     sync(&pc, server.addr()).await.unwrap(); // stored: genesis, add iPhone
 
@@ -134,14 +138,33 @@ async fn concurrent_histories_converge() {
     let forked = node_from(other, fork, "Other").await;
     let forked_sync = sync(&forked, server.addr()).await;
     sync(&pc, server.addr()).await.unwrap();
-    // Server and PC agree on the branch the rule picks, whichever arrived first.
-    assert_eq!(pc.group().log(), expected);
+    // The PC holds the branch the rule picks, whichever arrived first.
+    let pc_log = pc.group().log();
+    assert!(pc_log.entries().starts_with(expected.entries()));
+    let m = pc.group().membership();
     if expected == honest {
         // "Other" is not a member of the winning branch: it learns nothing.
+        assert_eq!(pc_log, honest);
         assert!(forked_sync.is_err());
     } else {
+        // The PC's branch lost: it replayed its own addition on top of the winner, so
+        // both devices end up members and nothing the PC did is lost.
         assert_eq!(forked.group().log(), expected);
+        assert!(m.members.values().any(|x| x.name == "iPhone"));
+        assert!(m.members.values().any(|x| x.name == "Other"));
     }
+}
+
+/// The same scenario many times, so both outcomes of the tie-break are exercised.
+#[tokio::test]
+async fn concurrent_histories_converge_repeatedly() {
+    for _ in 0..8 {
+        concurrent_histories_converge_once().await;
+    }
+}
+
+async fn concurrent_histories_converge_once() {
+    concurrent_histories_converge_body().await;
 }
 
 /// The attack found in review, end to end: an approver phone is stolen and removed, but
