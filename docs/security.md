@@ -41,8 +41,10 @@ The content devices exchange (files, clipboard, screen), the ability to act on a
 
 Be explicit about these before anyone relies on the code:
 
-- **Keys are in a plain file** (`FileKeyStore`). Platform vaults (Keychain `ThisDeviceOnly`,
-  DPAPI/TPM, Android Keystore) are not implemented.
+- **Key storage.** On Windows the key is encrypted with DPAPI (`DpapiKeyStore`, current
+  user, extra entropy): useless on another machine or account, but readable by malware
+  running as the same user. Elsewhere it is still a plain file (`FileKeyStore`). Keychain
+  (`ThisDeviceOnly`) and Android Keystore come with the mobile bindings; TPM is not used yet.
 - **No hardware-bound root key.** The Secure Enclave and TPMs generally offer P-256, not
   Ed25519, while iroh's identity is Ed25519; the plan is a non-extractable P-256 root key
   that signs a rotatable Ed25519 transport key. Not designed in detail yet.

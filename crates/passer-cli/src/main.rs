@@ -8,8 +8,8 @@
 //! passer-core call PC device.info                  # from either one
 //! ```
 //!
-//! Development tool: keys are stored in a plain file, and the network mode `n0` uses
-//! n0's public relays, which are reserved for development.
+//! Development tool. The device key is kept with DPAPI on Windows and in a plain file
+//! elsewhere; the network mode `n0` uses n0's public relays, reserved for development.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use iroh::EndpointAddr;
 use passer_bus::{Bus, Journal, Request, Response};
 use passer_device_info::DeviceInfo;
-use passer_identity::{DeviceId, FileKeyStore, KeyStore};
+use passer_identity::{DeviceId, platform_store};
 use passer_membership::DeviceLog;
 use passer_membership::pairing::Invitation;
 use passer_node::{Group, Network, Node, join, now_secs};
@@ -130,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let home = Home::resolve(cli.home)?;
     let network: Network = cli.network.into();
-    let identity = FileKeyStore::new(home.key()).load_or_create()?;
+    let identity = platform_store(home.key()).load_or_create()?;
 
     match cli.command {
         Command::Init { group, name } => {

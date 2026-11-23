@@ -5,14 +5,33 @@
 //! authenticates exactly the key the membership log knows about.
 //!
 //! The private key never leaves the device. Where it is kept is the job of a
-//! [`KeyStore`]. This crate ships only [`FileKeyStore`], meant for development and tests:
-//! production builds must use the operating system's vault (Keychain with
-//! `ThisDeviceOnly` on iOS, DPAPI or TPM on Windows, Keystore on Android). See
-//! `docs/security.md` for why the transport key is Ed25519 and how a hardware-bound
-//! root key is meant to sign it.
+//! [`KeyStore`]:
+//! - [`DpapiKeyStore`] on Windows: encrypted with DPAPI, bound to the user account;
+//! - [`FileKeyStore`] everywhere: plain file, for development and tests only.
+//!
+//! [`platform_store`] picks the right one. Keychain (`ThisDeviceOnly`) and Android
+//! Keystore come with the mobile bindings. See `docs/security.md` for why the transport
+//! key is Ed25519 and how a hardware-bound root key is meant to sign it.
+
+#[cfg(windows)]
+mod dpapi;
+#[cfg(windows)]
+pub use dpapi::DpapiKeyStore;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+
+/// The best key store available on this platform, for a key kept at `path`.
+pub fn platform_store(path: impl Into<PathBuf>) -> Box<dyn KeyStore> {
+    #[cfg(windows)]
+    {
+        Box::new(DpapiKeyStore::new(path))
+    }
+    #[cfg(not(windows))]
+    {
+        Box::new(FileKeyStore::new(path))
+    }
+}
 
 pub use iroh_base::{PublicKey, SecretKey, Signature, SignatureError};
 
@@ -158,7 +177,7 @@ impl KeyStore for FileKeyStore {
 }
 
 /// Creates the file exclusively, so two processes never overwrite each other's key.
-fn write_new_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_new_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
