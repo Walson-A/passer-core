@@ -19,8 +19,9 @@ permission check, a time-limited session and a local journal on the device that 
 | L2 Transport | `passer-node` | [iroh](https://github.com/n0-computer/iroh) QUIC connections dialed by key: local network first, NAT traversal, relay as a fallback. End-to-end encrypted (TLS 1.3, raw public keys). |
 | L3 Capability bus | `passer-bus` | Devices declare capabilities (schema close to MCP tools). Every call goes through **one** checkpoint on the target: membership, input schema, policy (allow / ask / deny), human approval, visible indicator, lease (stop button), journal without content. |
 | Server half | `passer-coord` | Coordination server: keeps each group's latest signed log and its devices' addresses, so removals reach offline devices and devices find each other across networks. Cannot add a device, never sees content, answers members only. Runs as a hosted service or inside a self-hosted engine. |
+| MCP bridge | `passer-mcp` | What your devices grant an AI agent, as MCP tools for Claude Desktop, Claude Code or Cursor (stdio). Agents get nothing until a device grants them a capability; each call is still checked, approved if needed and journaled on the device that acts. |
 | Example module | `passer-device-info` | The smallest module: `device.info`. The template for writing one. |
-| CLI | `passer-cli` | `passer-core init / serve --invite / join / call / sync / remove / journal`. |
+| CLI | `passer-cli` | `passer-core init / serve --invite / join / call / sync / remove / journal / grant / policy / mcp`. |
 
 What is **not** here, on purpose: file transfer (Passer's module), screen capture and
 remote control (a separate project that builds on this one), accounts, billing, the hosted
@@ -45,6 +46,24 @@ passer-coord --home ./coord                      # prints --coord <id>@<ip:port>
 passer-core --home ./pc --coord <id>@<ip:port> serve
 passer-core --home ./laptop --coord <id>@<ip:port> call PC device.info
 ```
+
+### Give an AI agent access to a device
+
+```sh
+# on the PC: allow the agent "claude", relayed by the laptop, to read device info
+passer-core --home ./pc grant --agent claude --via Laptop --capability device.info --decision allow
+```
+
+Then point your MCP client at the bridge on the laptop, e.g. in Claude Desktop's config:
+
+```json
+{ "mcpServers": { "passer": {
+    "command": "passer-core",
+    "args": ["--home", "C:/path/to/laptop", "--coord", "<id>@<ip:port>", "mcp", "--agent", "claude"]
+} } }
+```
+
+`--decision ask` makes the PC ask its user (or another approver device) at each use.
 
 Both screens show the same 6-digit code at join time; if they differ, someone is in the
 middle. `--network local` restricts to direct addresses; the default `n0` uses n0's public

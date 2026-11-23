@@ -118,11 +118,22 @@ other members seen in the last 5 minutes.
 The same crate serves Passer's hosted service (many groups) and a self-hosted engine (one
 group). Accounts, quotas, billing and abuse handling belong to the hosted service, not here.
 
+## MCP bridge (`passer-mcp`)
+
+A bridge device serves MCP over stdio to a local agent client. `tools/list` asks every other
+member which capabilities it grants this agent (`bus.capabilities` with the agent's name)
+and turns each `call` capability into a tool (`device.info` → `device_info`) with a `device`
+argument listing the devices that offer it (and `target` when the capability has one).
+Annotations follow the effect: `read` → read-only; `write` and `sensitive` → destructive,
+so clients confirm. `tools/call` forwards the call labelled with the agent's name. The
+bridge decides nothing: policy, approval, indicator, lease and journal happen on the device
+that acts. Agents are denied by default; `grant` adds a rule `Who::Agent { name, via }`
+pinned to the bridge device.
+
 ## Planned next
 
 - Streams (file transfer) on the bus; video stays WebRTC in the screen project, with the
   bus for identity, permission and signalling.
-- MCP bridge (capabilities → tools) and a local MCP server.
 - Platform key stores, hardware-bound root key; UniFFI bindings for iOS and Android.
 - Push notifications so approvals reach a sleeping phone; push of log updates (today:
   pull with `sync`).

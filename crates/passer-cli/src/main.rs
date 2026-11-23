@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use iroh::EndpointAddr;
-use passer_bus::{Bus, Journal, Request, Response};
+use passer_bus::{Bus, Decision, Journal, Policy, Request, Response, Rule, Who};
 use passer_device_info::DeviceInfo;
 use passer_identity::{DeviceId, platform_store};
 use passer_membership::DeviceLog;
@@ -109,6 +109,48 @@ enum Command {
     Remove { device: String },
     /// Prints the recent journal of calls received by this device.
     Journal,
+    /// Grants an AI agent a capability on this device, when relayed by a given device.
+    Grant {
+        /// Agent name, as the bridge announces it (e.g. `claude`).
+        #[arg(long)]
+        agent: String,
+        /// The device that runs the MCP bridge for this agent (name or id prefix).
+        #[arg(long)]
+        via: String,
+        /// Capability name, `prefix.*` or `*`.
+        #[arg(long)]
+        capability: String,
+        #[arg(long, value_enum, default_value_t = DecisionArg::Ask)]
+        decision: DecisionArg,
+        /// Restrict to one target (an app, a folder).
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// Shows this device's permission rules.
+    Policy,
+    /// Runs the MCP bridge on stdio for an agent client (Claude Desktop, Claude Code).
+    Mcp {
+        /// The name this bridge gives the agent; devices grant capabilities to it.
+        #[arg(long, default_value = "claude")]
+        agent: String,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum DecisionArg {
+    Allow,
+    Ask,
+    Deny,
+}
+
+impl From<DecisionArg> for Decision {
+    fn from(d: DecisionArg) -> Self {
+        match d {
+            DecisionArg::Allow => Decision::Allow,
+            DecisionArg::Ask => Decision::Ask,
+            DecisionArg::Deny => Decision::Deny,
+        }
+    }
 }
 
 struct Home(PathBuf);
@@ -132,6 +174,16 @@ impl Home {
     }
     fn journal(&self) -> PathBuf {
         self.0.join("journal.jsonl")
+    }
+    fn policy(&self) -> PathBuf {
+        self.0.join("policy.json")
+    }
+    fn load_policy(&self) -> anyhow::Result<Policy> {
+        match std::fs::read_to_string(self.policy()) {
+            Ok(text) => serde_json::from_str(&text).context("policy.json is malformed"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Policy::default()),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
@@ -209,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
                     .module(Arc::new(DeviceInfo::new(name.clone())))
                     .module(Arc::new(ApprovalModule::new(group.clone(), prompter)))
                     .approver(approver.clone())
+                    .policy(home.load_policy()?)
                     .journal(journal)
                     .build()?,
             );
@@ -322,6 +375,72 @@ async fn main() -> anyhow::Result<()> {
                 println!("Removed. Other devices learn it at their next `sync`.");
             }
             node.shutdown().await?;
+        }
+        Command::Grant {
+            agent,
+            via,
+            capability,
+            decision,
+            target,
+        } => {
+            let group = Group::load(home.group())?;
+            let via_id = resolve(&group, &via)?;
+            let mut policy = home.load_policy()?;
+            policy.rules.insert(
+                0,
+                Rule {
+                    who: Who::Agent {
+                        name: agent.clone(),
+                        via: Some(via_id),
+                    },
+                    capability: capability.clone(),
+                    target,
+                    decision: decision.into(),
+                    lease_secs: None,
+                },
+            );
+            std::fs::write(home.policy(), serde_json::to_string_pretty(&policy)?)?;
+            println!(
+                "{agent} (through {via}) may now `{capability}` on this device: {:?}. Restart `serve` to apply.",
+                Decision::from(decision)
+            );
+        }
+        Command::Policy => {
+            let policy = home.load_policy()?;
+            if policy.rules.is_empty() {
+                println!(
+                    "No rules: devices may read and write, sensitive actions ask, agents get nothing."
+                );
+            }
+            for (i, r) in policy.rules.iter().enumerate() {
+                println!("{i:>3}  {}", serde_json::to_string(r)?);
+            }
+        }
+        Command::Mcp { agent } => {
+            // stdout belongs to the MCP protocol from here on: no println!.
+            let group = Arc::new(
+                Group::load(home.group()).context("no group: run `init` or `join` first")?,
+            );
+            let bus = Arc::new(Bus::builder(group.clone()).build()?);
+            let options = NodeOptions {
+                network,
+                ..Default::default()
+            };
+            let node = Arc::new(Node::spawn(Arc::new(identity), group, bus, options).await?);
+            if let Some(server) = &coord {
+                // Learn where the devices are before the client lists tools.
+                if let Err(e) = passer_coord::sync(&node, server.clone()).await {
+                    eprintln!("coordination server unreachable: {e:#}");
+                }
+            }
+            let sync_loop = coord.map(|server| {
+                passer_coord::spawn_sync_loop(node.clone(), server, Duration::from_secs(30))
+            });
+            let result = passer_mcp::serve_stdio(passer_mcp::Bridge::new(node, agent)).await;
+            if let Some(task) = sync_loop {
+                task.abort();
+            }
+            result?;
         }
         Command::Journal => {
             let journal = Journal::open(home.journal())?;

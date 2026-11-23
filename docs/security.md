@@ -65,6 +65,11 @@ Be explicit about these before anyone relies on the code:
   requests (a member could spam prompts), and approvals reaching a phone that is asleep
   (needs push notifications).
 - **Streams are not implemented**; long-running modules must honour their lease themselves.
+- **Agent identity is asserted by the bridge device.** A grant pinned with `via` only trusts
+  that device's claim. A compromised bridge device can act as any agent it was granted for.
+  The hosted MCP service (OAuth, per-agent consent) is not part of this repository.
+- **The MCP bridge and `serve` use the same device key** when run side by side on one device:
+  both work for outgoing calls, but incoming calls reach only one of them.
 - **n0's public relays** are used by the CLI's default network mode: development only.
 - **No fuzzing yet.** Planned `cargo-fuzz` targets: invitation links, frames, the device log
   (JSON and verification), join requests, capability schemas.

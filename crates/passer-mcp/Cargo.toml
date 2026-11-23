@@ -1,0 +1,23 @@
+[package]
+name = "passer-mcp"
+description = "MCP bridge for passer-core: the capabilities your devices grant an agent, as MCP tools."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[dependencies]
+passer-identity = { path = "../passer-identity" }
+passer-bus = { path = "../passer-bus" }
+passer-node = { path = "../passer-node" }
+rmcp = { version = "3.11", features = ["server", "transport-io"] }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+passer-membership = { path = "../passer-membership" }
+passer-device-info = { path = "../passer-device-info" }
+rmcp = { version = "3.11", features = ["server", "client", "transport-io"] }
