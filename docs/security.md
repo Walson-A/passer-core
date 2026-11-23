@@ -15,7 +15,7 @@ The content devices exchange (files, clipboard, screen), the ability to act on a
 | Network observer (public Wi-Fi, ISP) | read or alter traffic | QUIC / TLS 1.3 with raw public keys (iroh); no cleartext mode in the core | in place |
 | Relay or coordination server (compromised, compelled, or careless) | read content; add a device | end-to-end encryption; **signed device log**: only an approver key can add a device | in place |
 | | withhold or roll back updates | devices and server keep the log the fork-choice rule prefers; a shorter history never replaces a longer one | in place for what a device has seen |
-| Removed (e.g. stolen) approver | keep control by publishing a fork made before its removal | **fork choice: revocation wins**, then the branch keeping more approvers, then seniority; every device and the server converge on the same branch | in place |
+| Removed (e.g. stolen) approver | keep control by publishing a fork made before its removal | **fork choice: revocation wins**; a removal is never dropped for a branch that removes less; the losing device replays its own entries on the winner; every device and the server converge on the same branch | in place |
 | Intercepted pairing (QR photographed, link leaked) | join the group | 256-bit one-time secret, ≤ 15 min; MAC + signature bound to the joiner's authenticated key; 6-digit SAS to compare | in place; PAKE for short typed codes planned |
 | Joining device | pass for another device by name | names unique in the group (case, spaces and punctuation ignored); invisible and bidirectional characters refused; ids shown in approval prompts | in place; look-alike letters from other scripts are not caught |
 | Lost or stolen device | keep using its access | removal by any approver; revoked keys never come back; its sessions are revoked and its open connections closed | in place |
@@ -52,7 +52,9 @@ The content devices exchange (files, clipboard, screen), the ability to act on a
   wire messages. A short run happens on every push in CI; run longer with
   `cargo +nightly fuzz run <target>`.
 - Concurrency: simultaneous joins, simultaneous calls, removal during a call and during a
-  pending approval.
+  pending approval, forks resolved and replayed.
+- Fork choice: antisymmetric on random forks (property test), so every party converges;
+  a removal is kept over a branch that removes less; the losing side replays its removals.
 
 ## Security review of 23 November 2026
 
@@ -60,7 +62,7 @@ An independent review (separate from the author of the code) reported 12 finding
 
 | # | Finding | Severity | Status |
 |---|---|---|---|
-| 1 | A removed approver could keep the group by publishing a pre-removal fork first | high | fixed: fork choice (`DeviceLog::prefer`), used by devices and server; test reproduces the attack end to end |
+| 1 | A removed approver could keep the group by publishing a pre-removal fork first | high | fixed: fork choice (`DeviceLog::prefer`), used by devices and server, plus replay of the losing side's own entries; tests reproduce the attack end to end. Follow-up from the reviewer: a removal could be dropped for a branch adding a device — fixed (removals are never dropped for a branch that removes less) |
 | 2 | Any member could show forged approval prompts with terminal escape sequences | medium | fixed: strings sanitized, ids shown, prompts rate-limited, one terminal reader |
 | 3 | Duplicate and look-alike device names | medium | fixed for case/spacing/punctuation and invisible/bidi characters; cross-script look-alikes remain (ids shown) |
 | 4 | A member could poison another device's MCP tool metadata | medium | fixed: one tool per distinct declaration, unique tool names |
@@ -91,6 +93,8 @@ An independent review (separate from the author of the code) reported 12 finding
   (every 30 s). A device that never saw an update cannot detect that the server withholds
   it; gossip between devices would reduce this. The server sees metadata (keys, device
   names, IPs, online times). No rate limiting of joins and publishes yet.
+- **Fork choice with three or more concurrent branches** is decided pairwise; the rule is
+  antisymmetric (tested) but its transitivity across many branches is not proven.
 - **Look-alike names** from other scripts (Cyrillic "РС" vs Latin "PC") are not caught;
   apps should show a short id next to names.
 - **The journal** detects edits and deleted lines in the middle, not truncation of its tail

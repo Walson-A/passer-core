@@ -668,8 +668,25 @@ impl Node {
     /// - a prefix of ours (the sender is behind): ignored;
     /// - anything else (another group, a fork, a forgery): refused.
     pub fn adopt_log(&self, log: DeviceLog) -> anyhow::Result<Membership> {
+        let before = self.group.log();
         let adoption = self.group.adopt(log)?;
         self.revoke(&adoption.removed);
+        if adoption.forked {
+            // Our branch lost the fork choice: replay what this device wrote after the
+            // fork point, so its removals and additions are not lost. Entries that no
+            // longer make sense on the winning branch (already done, now invalid) are skipped.
+            let after = self.group.log();
+            let k = before.common_prefix_len(&after);
+            let me = self.identity.id();
+            for entry in &before.entries()[k..] {
+                if entry.author == me {
+                    match self.group.append(&self.identity, entry.op.clone()) {
+                        Ok(removed) => self.revoke(&removed),
+                        Err(e) => tracing::info!("not replayed after the fork: {e:#}"),
+                    }
+                }
+            }
+        }
         Ok(self.group.membership())
     }
 

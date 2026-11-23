@@ -3,7 +3,7 @@
 
 use passer_identity::Identity;
 use passer_membership::pairing::{Invitation, InvitationBook, JoinRequest};
-use passer_membership::{DeviceLog, Op};
+use passer_membership::{DeviceLog, Op, Preferred};
 use proptest::prelude::*;
 
 /// A log with a few members and a removal, built once for all cases.
@@ -127,5 +127,124 @@ proptest! {
         let authenticated = bad.device;
         prop_assert!(book.redeem(&bad, &authenticated, 150).is_err());
         prop_assert!(book.redeem(&genuine, &joiner.id(), 150).is_ok());
+    }
+}
+
+/// Review follow-up: the owner removes a stolen phone that wrote nothing, while another
+/// approver adds a device. The removal must win, even though it leaves fewer approvers.
+#[test]
+fn a_removal_is_never_dropped_for_a_branch_that_removes_less() {
+    let founder = Identity::generate();
+    let laptop = Identity::generate();
+    let stolen = Identity::generate();
+    let mut base = DeviceLog::create(&founder, "G", "PC", 1).unwrap();
+    base.append(
+        &founder,
+        Op::Add {
+            device: laptop.id(),
+            name: "Laptop".into(),
+            approver: true,
+        },
+        2,
+    )
+    .unwrap();
+    base.append(
+        &founder,
+        Op::Add {
+            device: stolen.id(),
+            name: "Phone".into(),
+            approver: true,
+        },
+        3,
+    )
+    .unwrap();
+    let mut removal = base.clone();
+    removal
+        .append(
+            &founder,
+            Op::Remove {
+                device: stolen.id(),
+            },
+            4,
+        )
+        .unwrap();
+    let mut addition = base.clone();
+    let d = Identity::generate();
+    addition
+        .append(
+            &laptop,
+            Op::Add {
+                device: d.id(),
+                name: "Tablet".into(),
+                approver: false,
+            },
+            4,
+        )
+        .unwrap();
+    assert_eq!(removal.prefer(&addition), Ok(Preferred::Ours));
+    assert_eq!(addition.prefer(&removal), Ok(Preferred::Theirs));
+}
+
+/// Builds a random valid branch on top of `base`, written by the given approvers.
+fn random_branch(base: &DeviceLog, authors: &[&Identity], plan: &[(u8, u8)]) -> DeviceLog {
+    let mut log = base.clone();
+    for (i, (who, what)) in plan.iter().enumerate() {
+        let author = authors[*who as usize % authors.len()];
+        let m = log.verify().unwrap();
+        let op = if what % 2 == 0 {
+            let d = Identity::generate();
+            Op::Add {
+                device: d.id(),
+                name: format!("N{}x{}", i, what),
+                approver: what % 4 == 0,
+            }
+        } else {
+            let others: Vec<_> = m
+                .members
+                .keys()
+                .filter(|k| **k != author.id())
+                .copied()
+                .collect();
+            if others.is_empty() {
+                continue;
+            }
+            Op::Remove {
+                device: others[*what as usize % others.len()],
+            }
+        };
+        let _ = log.append(author, op, 10 + i as u64); // invalid ops are simply skipped
+    }
+    log
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// The choice is the same from both sides, whatever the branches contain, so every
+    /// device and the server converge.
+    #[test]
+    fn fork_choice_is_antisymmetric(
+        a in prop::collection::vec((0u8..3, 0u8..8), 0..4),
+        b in prop::collection::vec((0u8..3, 0u8..8), 0..4),
+    ) {
+        let founder = Identity::generate();
+        let x = Identity::generate();
+        let y = Identity::generate();
+        let mut base = DeviceLog::create(&founder, "G", "PC", 1).unwrap();
+        base.append(&founder, Op::Add { device: x.id(), name: "X".into(), approver: true }, 2).unwrap();
+        base.append(&founder, Op::Add { device: y.id(), name: "Y".into(), approver: true }, 3).unwrap();
+        let authors = [&founder, &x, &y];
+        let la = random_branch(&base, &authors, &a);
+        let lb = random_branch(&base, &authors, &b);
+        let ab = la.prefer(&lb).unwrap();
+        let ba = lb.prefer(&la).unwrap();
+        match ab {
+            Preferred::Same => prop_assert_eq!(ba, Preferred::Same),
+            Preferred::Ours => prop_assert_eq!(ba, Preferred::Theirs),
+            Preferred::Theirs => prop_assert_eq!(ba, Preferred::Ours),
+        }
+        if ab == Preferred::Same {
+            prop_assert_eq!(la, lb);
+        }
     }
 }

@@ -229,3 +229,40 @@ async fn a_joiner_cannot_impersonate_by_name() {
     }
     assert_eq!(pc.group().membership().members.len(), 1);
 }
+
+/// Review follow-up: when this device's branch loses a fork, what it wrote is replayed on
+/// the winner, so a removal made here is not lost.
+#[tokio::test]
+async fn the_losing_side_replays_its_removals() {
+    let pc = pc_with(Arc::new(Notify::new()), None).await;
+    // The laptop joins as an approver; two phones join as members.
+    let inv = pc.invite_approver(300).unwrap();
+    let laptop_id = Identity::generate();
+    let (log, _) = join(&laptop_id, &inv, "Laptop", Network::LocalOnly)
+        .await
+        .unwrap();
+    let p = member_of(&pc, "Phone P").await;
+    let q = member_of(&pc, "Phone Q").await;
+    let laptop_group = Arc::new(Group::new(log, None).unwrap());
+    let laptop = Node::spawn(
+        Arc::new(laptop_id),
+        laptop_group.clone(),
+        Arc::new(Bus::builder(laptop_group).build().unwrap()),
+        NodeOptions::default(),
+    )
+    .await
+    .unwrap();
+    laptop.sync_log(pc.addr()).await.unwrap(); // laptop now knows both phones
+
+    // Offline from each other: the PC removes P, the laptop removes Q.
+    pc.remove(p.id()).unwrap();
+    laptop.remove(q.id()).unwrap();
+
+    // They meet. The founder's branch wins the tie; the laptop replays its removal.
+    let m = laptop.adopt_log(pc.group().log()).unwrap();
+    assert!(!m.is_member(&p.id()), "the PC's removal is kept");
+    assert!(!m.is_member(&q.id()), "the laptop's removal was replayed");
+    let m = pc.adopt_log(laptop.group().log()).unwrap();
+    assert!(!m.is_member(&p.id()) && !m.is_member(&q.id()));
+    assert_eq!(pc.group().log(), laptop.group().log(), "both converged");
+}

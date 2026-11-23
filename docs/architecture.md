@@ -43,8 +43,10 @@ only if it extends the one already held (refusing rollbacks and forks).
 **Forks.** Two valid branches can exist (two approvers writing at once, or a removed
 approver publishing a branch made before its removal). `DeviceLog::prefer` picks one, the
 same way on every device and on the server: revocation wins (a branch that removes the
-other branch's authors), then the branch keeping more approvers from the fork point, then
-the more senior device, then the lower digest. Names must be unique in a group (ignoring
+other branch's authors); on mutual revocation, the branch keeping more approvers from the
+fork point; otherwise a branch whose removals strictly contain the other's; then the more
+senior device, then the lower digest. The device whose branch lost replays its own entries
+on the winner (`Node::adopt_log`), so its removals are re-applied. Names must be unique in a group (ignoring
 case, spaces and punctuation) and free of invisible or bidirectional characters. Logs are
 capped at 4096 entries.
 

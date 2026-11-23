@@ -247,6 +247,15 @@ impl DeviceLog {
         &self.entries
     }
 
+    /// How many leading entries two logs share.
+    pub fn common_prefix_len(&self, other: &DeviceLog) -> usize {
+        self.entries
+            .iter()
+            .zip(&other.entries)
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+
     /// The first `n` entries (a genuine, older state of the same log).
     pub fn prefix(&self, n: usize) -> DeviceLog {
         DeviceLog {
@@ -328,10 +337,15 @@ impl DeviceLog {
     /// 1. **Revocation wins.** If one branch removes a device that wrote entries in the
     ///    other branch, and not the reverse, it wins. A removed (e.g. stolen) approver
     ///    cannot keep its own branch alive by publishing it first.
-    /// 2. If both branches revoke each other's authors, or neither does, the branch that
-    ///    keeps more of the approvers present at the fork point wins.
-    /// 3. Then the branch whose first divergent entry comes from the more senior device
+    /// 2. If both branches revoke each other's authors, the branch that keeps more of the
+    ///    approvers present at the fork point wins.
+    /// 3. If neither does, a branch whose removals strictly contain the other's wins:
+    ///    a removal is never dropped for a branch that removes less.
+    /// 4. Then the branch whose first divergent entry comes from the more senior device
     ///    (added earlier) wins; then the lower entry digest, so the choice is never a tie.
+    ///
+    /// A device whose branch loses replays its own entries on the winner
+    /// (`passer_node::Node::adopt_log`), so a removal it made is re-applied.
     ///
     /// With only two approvers that revoke each other, rule 3 decides; recovery beyond
     /// that needs a recovery code (not implemented yet).
@@ -373,13 +387,27 @@ impl DeviceLog {
         match (ours_revokes_theirs, theirs_revokes_ours) {
             (true, false) => return Ok(Preferred::Ours),
             (false, true) => return Ok(Preferred::Theirs),
-            _ => {}
-        }
-        let kept = |m: &Membership| base.approvers().filter(|a| m.is_approver(a)).count();
-        match kept(&ours_m).cmp(&kept(&theirs_m)) {
-            std::cmp::Ordering::Greater => return Ok(Preferred::Ours),
-            std::cmp::Ordering::Less => return Ok(Preferred::Theirs),
-            std::cmp::Ordering::Equal => {}
+            (true, true) => {
+                // Mutual: the branch that keeps more of the fork point's approvers.
+                let kept = |m: &Membership| base.approvers().filter(|a| m.is_approver(a)).count();
+                match kept(&ours_m).cmp(&kept(&theirs_m)) {
+                    std::cmp::Ordering::Greater => return Ok(Preferred::Ours),
+                    std::cmp::Ordering::Less => return Ok(Preferred::Theirs),
+                    std::cmp::Ordering::Equal => {}
+                }
+            }
+            (false, false) => {
+                // Neither touches the other's authors: never drop a removal in favour of a
+                // branch that removes less. (Incomparable removals fall through; the
+                // losing device replays its own entries on the winner, see passer-node.)
+                let (ro, rt) = (removed(ours), removed(theirs));
+                if ro.is_superset(&rt) && ro != rt {
+                    return Ok(Preferred::Ours);
+                }
+                if rt.is_superset(&ro) && ro != rt {
+                    return Ok(Preferred::Theirs);
+                }
+            }
         }
         let seniority = |e: &Entry| {
             base.members
