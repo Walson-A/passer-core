@@ -27,6 +27,13 @@ it will come.
 
 - **AI agents**: run `passer-core mcp` and grant capabilities with `passer-core grant`.
 
+- **A devices screen**: `members()` returns each member with what it last said about itself
+  (kind, OS and version, app version, when it last answered); declare your own with
+  `set_device_details` before `start`. `member_capabilities(device)` lists what a member lets
+  you call and which of it needs approval, to make buttons. `journal_recent(limit, device)`
+  is the history with one member (calls made and received, never their content). Call
+  `refresh_members()` after a device joins or when the app returns to the foreground.
+
 ## What is missing before a third party should ship on it
 
 | Missing | Why it matters | Plan |

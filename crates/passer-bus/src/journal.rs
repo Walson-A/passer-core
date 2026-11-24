@@ -1,6 +1,9 @@
 //! The local journal: one line per invocation, chained by hash so that a deleted or
 //! edited line shows. It records who asked for what and what happened, **never the
 //! content** (no inputs, no outputs).
+//!
+//! Most lines are calls this device received (`device` is the requester). A line with
+//! `to` is a call this device made to that member.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -19,6 +22,10 @@ pub struct Record {
     pub seq: u64,
     pub at: u64,
     pub device: String,
+    /// Set on calls this device made: the member it called. Absent on received calls,
+    /// so lines written before this field existed keep their hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     pub capability: String,
@@ -46,6 +53,7 @@ pub struct Line {
 #[derive(Clone, Debug, Default)]
 pub struct Event {
     pub device: String,
+    pub to: Option<String>,
     pub agent: Option<String>,
     pub capability: String,
     pub target: Option<String>,
@@ -166,6 +174,7 @@ impl Journal {
             seq: inner.seq,
             at: now_secs(),
             device: event.device,
+            to: event.to,
             agent: event.agent,
             capability: event.capability,
             target: event.target,
@@ -224,6 +233,30 @@ mod tests {
             outcome: "ok".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn lines_without_to_keep_their_hash() {
+        // A line written before `to` existed: its JSON has no `to` key.
+        let r = Record {
+            seq: 0,
+            at: 1,
+            device: "dev".into(),
+            to: None,
+            agent: None,
+            capability: "a.one".into(),
+            target: None,
+            decision: "allow".into(),
+            approved: None,
+            outcome: "ok".into(),
+            prev: GENESIS.into(),
+        };
+        assert!(!serde_json::to_string(&r).unwrap().contains("\"to\""));
+        let out = Record {
+            to: Some("peer".into()),
+            ..r.clone()
+        };
+        assert_ne!(hash_record(&r), hash_record(&out));
     }
 
     #[test]

@@ -15,14 +15,17 @@
 //!   file...), for the [`CapabilitySpec`]s it declares. The bus checks permissions, asks for
 //!   approval, enforces sessions and journals *before* the handler is called.
 
+mod members;
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use members::MemberCache;
 use passer_bus::{
-    Bus, Capability, Ctx, Effect, IndicatorRequirement, Journal, Manifest, Module, ModuleError,
-    Policy, Request, Response,
+    Bus, Capability, Ctx, Effect, Event, IndicatorRequirement, Journal, Manifest, Module,
+    ModuleError, Policy, Request, Response,
 };
 use passer_identity::{DeviceId, Identity, IdentityError, KeyStore};
 use passer_membership::DeviceLog;
@@ -123,13 +126,97 @@ pub struct CapabilitySpec {
     pub indicator_required: bool,
 }
 
-/// A member of the group.
+/// What sort of device a member is. The app tells the core for its own device
+/// ([`PasserDevice::set_device_details`]); other members say it themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum DeviceKind {
+    Phone,
+    Tablet,
+    Laptop,
+    Desktop,
+    Unknown,
+}
+
+impl From<DeviceKind> for passer_device_info::DeviceKind {
+    fn from(k: DeviceKind) -> Self {
+        match k {
+            DeviceKind::Phone => Self::Phone,
+            DeviceKind::Tablet => Self::Tablet,
+            DeviceKind::Laptop => Self::Laptop,
+            DeviceKind::Desktop => Self::Desktop,
+            DeviceKind::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<passer_device_info::DeviceKind> for DeviceKind {
+    fn from(k: passer_device_info::DeviceKind) -> Self {
+        use passer_device_info::DeviceKind as K;
+        match k {
+            K::Phone => Self::Phone,
+            K::Tablet => Self::Tablet,
+            K::Laptop => Self::Laptop,
+            K::Desktop => Self::Desktop,
+            K::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// A member of the group: who it is (from the verified device log), and what it last
+/// said about itself (from the member cache, refreshed by
+/// [`PasserDevice::refresh_members`]). The descriptive fields come from that device and
+/// are only for display.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct MemberInfo {
     pub id: String,
     pub name: String,
     pub approver: bool,
     pub this_device: bool,
+    pub kind: DeviceKind,
+    /// `windows`, `macos`, `ios`, `android`, `linux`...
+    pub os: Option<String>,
+    pub os_version: Option<String>,
+    pub app_version: Option<String>,
+    /// The passer-core version it runs.
+    pub core_version: Option<String>,
+    /// When it last answered this device (Unix seconds). `None`: never, or this device.
+    pub answered_at: Option<u64>,
+}
+
+/// A capability another member lets this device call, as it last said.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct OfferedCapability {
+    pub name: String,
+    pub title: String,
+    pub description: String,
+    pub effect: EffectKind,
+    pub target_kind: Option<String>,
+    /// A human on an approver device approves each session first.
+    pub needs_approval: bool,
+}
+
+/// One line of this device's journal. Never holds what was sent or received.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct JournalEntry {
+    pub seq: u64,
+    /// Unix seconds.
+    pub at: u64,
+    /// `true`: this device called `peer_id`. `false`: `peer_id` called this device.
+    pub outgoing: bool,
+    pub peer_id: String,
+    /// The peer's current name in the group, empty if it has left.
+    pub peer_name: String,
+    pub agent: Option<String>,
+    pub capability: String,
+    pub target: Option<String>,
+    /// On received calls: `allow`, `ask` or `deny` before any approval (`none` when the
+    /// call was refused before the policy, e.g. an unknown capability, and on calls this
+    /// device made).
+    pub decision: String,
+    /// Set when a human was asked.
+    pub approved: Option<bool>,
+    /// `ok`, or an error code such as `denied`, `approval_timeout` or `unreachable`.
+    pub outcome: String,
 }
 
 #[derive(Clone, Debug, uniffi::Record)]
@@ -321,6 +408,7 @@ fn name_of(group: &Group, device: &DeviceId) -> String {
 struct Running {
     node: Arc<Node>,
     sync_loop: Option<tokio::task::JoinHandle<()>>,
+    refresh: tokio::task::JoinHandle<()>,
     coord: Option<iroh::EndpointAddr>,
 }
 
@@ -335,19 +423,27 @@ pub struct PasserDevice {
     modules: Mutex<Vec<AppModule>>,
     prompter: Mutex<Option<Arc<dyn ApprovalPrompter>>>,
     admissions: Mutex<Option<Arc<dyn AdmissionListener>>>,
+    details: Mutex<passer_device_info::Details>,
+    cache: Arc<MemberCache>,
     running: tokio::sync::Mutex<Option<Running>>,
 }
 
 impl PasserDevice {
     fn with_identity(home: PathBuf, identity: Identity) -> Arc<Self> {
         Arc::new(Self {
+            cache: MemberCache::open(home.join("members.json")),
             home,
             identity: Arc::new(identity),
             modules: Mutex::default(),
             prompter: Mutex::default(),
             admissions: Mutex::default(),
+            details: Mutex::default(),
             running: tokio::sync::Mutex::default(),
         })
+    }
+
+    fn journal_path(&self) -> PathBuf {
+        self.home.join("journal.jsonl")
     }
 
     /// For desktop apps written in Rust: the key is kept by the platform's store
@@ -466,20 +562,150 @@ impl PasserDevice {
         })
     }
 
-    /// The group's members, as this device's verified log says.
+    /// The group's members, as this device's verified log says, with what each last said
+    /// about itself.
     pub fn members(&self) -> Result<Vec<MemberInfo>, PasserError> {
         let me = self.identity.id();
+        let mine = self.details.lock().expect("details lock").clone();
         Ok(self
             .load_group()?
             .membership()
             .members
             .into_iter()
-            .map(|(id, m)| MemberInfo {
-                id: id.to_string(),
-                name: m.name,
-                approver: m.approver,
-                this_device: id == me,
+            .map(|(id, m)| {
+                let mut info = MemberInfo {
+                    id: id.to_string(),
+                    name: m.name,
+                    approver: m.approver,
+                    this_device: id == me,
+                    kind: DeviceKind::Unknown,
+                    os: None,
+                    os_version: None,
+                    app_version: None,
+                    core_version: None,
+                    answered_at: None,
+                };
+                if id == me {
+                    info.kind = mine.kind.into();
+                    info.os = Some(std::env::consts::OS.into());
+                    info.os_version = mine.os_version.clone();
+                    info.app_version = mine.app_version.clone();
+                    info.core_version = Some(env!("CARGO_PKG_VERSION").into());
+                } else if let Some(entry) = self.cache.get(&id) {
+                    info.answered_at = Some(entry.answered_at);
+                    if let Some(d) = entry.described {
+                        info.kind = passer_device_info::DeviceKind::parse(&d.kind).into();
+                        info.os = d.os;
+                        info.os_version = d.os_version;
+                        info.app_version = d.app_version;
+                        info.core_version = d.core_version;
+                    }
+                }
+                info
             })
+            .collect())
+    }
+
+    /// Describes this device to the others: its kind, OS version and app version. Call
+    /// before `start`.
+    pub fn set_device_details(
+        &self,
+        kind: DeviceKind,
+        os_version: Option<String>,
+        app_version: Option<String>,
+    ) {
+        *self.details.lock().expect("details lock") = passer_device_info::Details {
+            kind: kind.into(),
+            os_version: os_version.map(|v| passer_bus::printable(&v, 64)),
+            app_version: app_version.map(|v| passer_bus::printable(&v, 64)),
+        };
+    }
+
+    /// Asks every other member, now, what it is and what it offers this device. Returns
+    /// how many answered. `start` runs one in the background; call it again after a
+    /// device joins, or when the app comes back to the foreground.
+    pub async fn refresh_members(&self) -> Result<u32, PasserError> {
+        let node = self.node().await?;
+        Ok(self.cache.refresh(&node).await)
+    }
+
+    /// What another member (by name or id) lets this device call, as it last said.
+    /// Empty until it has answered a refresh.
+    pub fn member_capabilities(
+        &self,
+        device: String,
+    ) -> Result<Vec<OfferedCapability>, PasserError> {
+        let group = self.load_group()?;
+        let id = self.resolve(&group, &device)?;
+        Ok(self
+            .cache
+            .get(&id)
+            .map(|e| e.offered)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|o| OfferedCapability {
+                effect: match o.effect.as_str() {
+                    "read" => EffectKind::Read,
+                    "write" => EffectKind::Write,
+                    _ => EffectKind::Sensitive,
+                },
+                name: o.name,
+                title: o.title,
+                description: o.description,
+                target_kind: o.target_kind,
+                needs_approval: o.needs_approval,
+            })
+            .collect())
+    }
+
+    /// The most recent lines of this device's journal (at most 200 are kept for display),
+    /// newest first, optionally only those with one member (by name or id).
+    pub async fn journal_recent(
+        &self,
+        limit: u32,
+        device: Option<String>,
+    ) -> Result<Vec<JournalEntry>, PasserError> {
+        let group = self.load_group()?;
+        let only = device
+            .map(|d| self.resolve(&group, &d).map(|id| id.to_string()))
+            .transpose()?;
+        let lines = match self.running.lock().await.as_ref() {
+            Some(r) => r.node.bus().journal().recent(),
+            None if self.journal_path().exists() => Journal::open(self.journal_path())
+                .map_err(PasserError::storage)?
+                .recent(),
+            None => Vec::new(),
+        };
+        let members = group.membership().members;
+        Ok(lines
+            .into_iter()
+            .rev()
+            .map(|l| l.record)
+            .map(|r| {
+                let outgoing = r.to.is_some();
+                let peer_id = r.to.clone().unwrap_or_else(|| r.device.clone());
+                let peer_name = peer_id
+                    .parse::<DeviceId>()
+                    .ok()
+                    .and_then(|id| members.get(&id))
+                    .map(|m| m.name.clone())
+                    .unwrap_or_default();
+                JournalEntry {
+                    seq: r.seq,
+                    at: r.at,
+                    outgoing,
+                    peer_id,
+                    peer_name,
+                    agent: r.agent,
+                    capability: r.capability,
+                    target: r.target,
+                    decision: r.decision,
+                    approved: r.approved,
+                    outcome: r.outcome,
+                }
+            })
+            .filter(|e| only.as_ref().is_none_or(|id| *id == e.peer_id))
+            .take(limit as usize)
             .collect())
     }
 
@@ -541,12 +767,15 @@ impl PasserDevice {
             .map(|p| Arc::new(ForeignPrompter(p)) as Arc<dyn Prompter>);
         let approver = RemoteApprover::new(group.clone(), prompter.clone());
         let me = name_of(&group, &self.identity.id());
+        let details = self.details.lock().expect("details lock").clone();
         let mut builder = Bus::builder(group.clone())
-            .module(Arc::new(passer_device_info::DeviceInfo::new(me)))
+            .module(Arc::new(
+                passer_device_info::DeviceInfo::new(me).with_details(details),
+            ))
             .approver(approver.clone())
             .policy(self.load_policy()?)
             .journal(Arc::new(
-                Journal::open(self.home.join("journal.jsonl")).map_err(PasserError::storage)?,
+                Journal::open(self.journal_path()).map_err(PasserError::storage)?,
             ));
         if let Some(p) = prompter {
             builder = builder.module(Arc::new(ApprovalModule::new(group.clone(), p)));
@@ -581,9 +810,18 @@ impl PasserDevice {
         let sync_loop = coord.clone().map(|server| {
             passer_coord::spawn_sync_loop(node.clone(), server, Duration::from_secs(30))
         });
+        // What the other members are and offer, for the UI: in the background, so that
+        // `start` does not wait for devices that are asleep.
+        let refresh = {
+            let (cache, node) = (self.cache.clone(), node.clone());
+            tokio::spawn(async move {
+                cache.refresh(&node).await;
+            })
+        };
         *running = Some(Running {
             node,
             sync_loop,
+            refresh,
             coord,
         });
         Ok(())
@@ -593,6 +831,8 @@ impl PasserDevice {
     pub async fn stop(&self) {
         if let Some(r) = self.running.lock().await.take() {
             r.node.bus().leases().revoke_all("device stopped");
+            r.refresh.abort();
+            let _ = r.refresh.await;
             if let Some(task) = r.sync_loop {
                 task.abort();
                 let _ = task.await;
@@ -659,11 +899,24 @@ impl PasserDevice {
             serde_json::from_str(&input_json).map_err(PasserError::invalid)?
         };
         let addr = node.peers().addr_of(&id);
-        match node
-            .call(addr, Request::new(&capability, input))
-            .await
-            .map_err(PasserError::network)?
-        {
+        let result = node.call(addr, Request::new(&capability, input)).await;
+        // One line for each call this device makes, like the ones it receives.
+        let outcome = match &result {
+            Ok(Response::Ok { .. }) => "ok".to_owned(),
+            Ok(Response::Error { code, .. }) => code.as_str().to_owned(),
+            Err(_) => "unreachable".to_owned(),
+        };
+        if let Err(e) = node.bus().journal().append(Event {
+            device: self.identity.id().to_string(),
+            to: Some(id.to_string()),
+            capability: passer_bus::printable(&capability, 96),
+            decision: "none".into(),
+            outcome,
+            ..Default::default()
+        }) {
+            tracing::error!("journal write failed: {e}");
+        }
+        match result.map_err(PasserError::network)? {
             Response::Ok { output } => Ok(output.to_string()),
             Response::Error { code, message } => Err(PasserError::Refused {
                 code: code.as_str().into(),

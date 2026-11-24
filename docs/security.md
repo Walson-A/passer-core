@@ -39,7 +39,11 @@ The content devices exchange (files, clipboard, screen), the ability to act on a
 5. **Revocation is final**, wins forks, interrupts running sessions and closes connections.
 6. **Sensitive capabilities ask on the target, run with a visible indicator, in a bounded
    session** that a stop button or physical input can cut.
-7. **Local journal** of every call, hash-chained, without content; every string printable.
+7. **Local journal** of every call, made or received, hash-chained, without content; every
+   string printable.
+8. **What members say about themselves is display only:** `device.info` answers are bounded,
+   sanitized and never used for a decision, and a background refresh never triggers an
+   approval prompt on another device.
 
 ## Testing
 

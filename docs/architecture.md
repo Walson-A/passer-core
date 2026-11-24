@@ -97,9 +97,25 @@ optional `output_schema`, `effect` (`read` / `write` / `sensitive`), `mode` (`ca
    is shown for the lease's lifetime;
 6. **lease**: the module runs inside a `LeaseHandle` the device can suspend (e.g. physical
    input) or revoke (stop button, device removed); revocation interrupts the call;
-7. **journal**: one hash-chained line, never the input or output.
+7. **journal**: one hash-chained line, never the input or output. A device also journals
+   the calls it makes (`to` set to the member it called), so each side keeps its own record.
 
-`bus.capabilities` (built in) lists what the caller may invoke — the basis of the MCP bridge.
+`bus.capabilities` (built in) lists what the caller may invoke — the basis of the MCP bridge
+— each entry with the `decision` the caller would get without a target (`allow` or `ask`).
+Readers that only know `Capability` ignore that field.
+
+### What members know about each other (`passer-ffi`, member cache)
+
+Apps want to show more than the log's names: what each device is and what it offers. After
+`start`, and whenever the app asks (`refresh_members`), the device asks every other member:
+
+1. `bus.capabilities`: what this device may call there, and what needs approval;
+2. `device.info`, **only if it is listed as `allow`**: name, kind (phone, tablet, laptop,
+   desktop, as its app declared), OS and version, architecture, passer-core and app versions.
+
+A refresh therefore never makes another device ask its user anything. Answers are stored in
+`members.json` (bounded, printable, unknown kinds read as `unknown`) and dropped when a device
+leaves the group. They only decorate the UI: every call is still decided by the target's bus.
 
 ### Approvals (`passer-node::approval`)
 

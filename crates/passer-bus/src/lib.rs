@@ -40,6 +40,16 @@ pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Longest accepted target string.
 pub const MAX_TARGET_LEN: usize = 256;
 
+/// One entry of `bus.capabilities`: the capability, and the decision the policy gives
+/// the requester when no target is involved. Readers that only know [`Capability`] ignore
+/// `decision`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Listed {
+    #[serde(flatten)]
+    pub capability: Capability,
+    pub decision: Decision,
+}
+
 /// Read access to the group's membership, provided by whoever owns the device log.
 pub trait MembershipView: Send + Sync {
     fn is_member(&self, device: &DeviceId) -> bool;
@@ -242,21 +252,33 @@ impl Bus {
 
     /// The capabilities `subject` could invoke (everything not denied outright).
     pub fn capabilities_for(&self, subject: &Subject) -> Vec<Capability> {
+        self.listing_for(subject)
+            .into_iter()
+            .map(|l| l.capability)
+            .collect()
+    }
+
+    /// The capabilities `subject` could invoke, each with what would happen: run at once
+    /// (`allow`) or after a human approves (`ask`). This is what `bus.capabilities`
+    /// answers.
+    pub fn listing_for(&self, subject: &Subject) -> Vec<Listed> {
         let policy = self.policy.read().expect("policy lock");
         let mut v: Vec<_> = self
             .caps
             .values()
-            .filter(|r| {
+            .filter_map(|r| {
                 // Without a target we cannot know a per-target rule; show the capability
                 // unless it is denied for every target.
-                policy
+                let decision = policy
                     .evaluate(subject, &r.capability.name, None, r.capability.effect)
-                    .decision
-                    != Decision::Deny
+                    .decision;
+                (decision != Decision::Deny).then(|| Listed {
+                    capability: r.capability.clone(),
+                    decision,
+                })
             })
-            .map(|r| r.capability.clone())
             .collect();
-        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v.sort_by(|a, b| a.capability.name.cmp(&b.capability.name));
         v
     }
 
@@ -301,7 +323,7 @@ impl Bus {
         if request.capability == LIST_CAPABILITY {
             event.decision = "allow".into();
             return Response::Ok {
-                output: json!({ "capabilities": self.capabilities_for(subject) }),
+                output: json!({ "capabilities": self.listing_for(subject) }),
             };
         }
         let Some(reg) = self.caps.get(&request.capability) else {
