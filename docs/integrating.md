@@ -34,6 +34,11 @@ it will come.
   [`platforms.md`](platforms.md)), build the library for your targets, and implement the
   three callbacks (`KeyVault`, `ApprovalPrompter`, `CapabilityHandler`).
 
+- **Rust hosts and raw streams**: `PasserDevice::add_module` (any `passer_bus::Module`, such
+  as `passer_exec::Exec` to run a helper program over a stream), `set_indicator` (required
+  for capabilities that show or control the device), and `open_stream` on the caller's
+  side. These are Rust only; Swift and Kotlin apps use the file transfers.
+
 - **AI agents**: run `passer-core mcp` and grant capabilities with `passer-core grant`.
 
 - **Your own servers**: a relay and a coordination server, with Docker

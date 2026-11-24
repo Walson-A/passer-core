@@ -515,3 +515,128 @@ async fn files_go_both_ways_whole_or_not_at_all() {
     pc.stop().await;
     phone.stop().await;
 }
+
+/// A Rust host's own stream module: sends back what it receives.
+struct Echo;
+
+#[async_trait]
+impl passer_ffi::passer_bus::Module for Echo {
+    fn manifest(&self) -> passer_ffi::passer_bus::Manifest {
+        let mut cap = passer_ffi::passer_bus::Capability::call(
+            "test.echo",
+            "Echo",
+            "Sends back what it receives.",
+            passer_ffi::passer_bus::Effect::Read,
+            serde_json::json!({ "type": "object" }),
+        );
+        cap.mode = passer_ffi::passer_bus::Mode::Stream;
+        cap.indicator = passer_ffi::passer_bus::IndicatorRequirement::Required;
+        passer_ffi::passer_bus::Manifest {
+            module: "echo".into(),
+            version: "1".into(),
+            capabilities: vec![cap],
+        }
+    }
+
+    async fn invoke(
+        &self,
+        _: passer_ffi::passer_bus::Ctx,
+        c: &str,
+        _: serde_json::Value,
+    ) -> Result<serde_json::Value, passer_ffi::passer_bus::ModuleError> {
+        Err(passer_ffi::passer_bus::ModuleError::Unsupported(c.into()))
+    }
+
+    async fn invoke_stream(
+        &self,
+        _: passer_ffi::passer_bus::Ctx,
+        _: &str,
+        _: serde_json::Value,
+        mut io: passer_ffi::passer_bus::StreamIo,
+    ) -> Result<serde_json::Value, passer_ffi::passer_bus::ModuleError> {
+        while let Ok(Some(bytes)) = io.incoming.next().await {
+            let _ = io.outgoing.send(&bytes).await;
+        }
+        Ok(serde_json::json!({ "echoed": true }))
+    }
+}
+
+#[derive(Default)]
+struct Hud(Mutex<u32>);
+
+impl passer_ffi::passer_bus::Indicator for Hud {
+    fn show(&self, _: &passer_ffi::passer_bus::LeaseInfo) {
+        *self.0.lock().unwrap() += 1;
+    }
+    fn hide(&self, _: u64) {}
+}
+
+#[tokio::test]
+async fn rust_hosts_add_stream_modules_and_open_streams() {
+    let dir = tempfile::tempdir().unwrap();
+    let pc = device(&dir, "pc", Arc::default());
+    pc.create_group("Walson".into(), "PC".into()).unwrap();
+    pc.add_module(Arc::new(Echo));
+    let hud = Arc::new(Hud::default());
+    pc.set_indicator(hud.clone());
+    pc.start(NetworkKind::LocalOnly, None).await.unwrap();
+
+    let invite = pc.invite(5, false).await.unwrap();
+    let viewer = device(&dir, "viewer", Arc::default());
+    viewer
+        .join(invite.link, "Atlas".into(), NetworkKind::LocalOnly)
+        .await
+        .unwrap();
+    viewer.start(NetworkKind::LocalOnly, None).await.unwrap();
+    viewer
+        .add_peer_address("PC".into(), pc.addresses().await.unwrap().remove(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        pc.member_name(&viewer.device_id()).as_deref(),
+        Some("Atlas")
+    );
+
+    let mut open = viewer
+        .open_stream("PC".into(), "test.echo".into(), "{}".into())
+        .await
+        .unwrap();
+    open.io.outgoing.send(b"frame 1").await.unwrap();
+    assert_eq!(open.io.incoming.next().await.unwrap().unwrap(), b"frame 1");
+    drop(open.io);
+    let result = open.done.await.unwrap().unwrap();
+    assert!(
+        matches!(result, passer_ffi::passer_bus::Response::Ok { .. }),
+        "{result:?}"
+    );
+    assert_eq!(*hud.0.lock().unwrap(), 1, "the PC showed its indicator");
+
+    // Without an indicator, a capability that requires one is refused.
+    let bare = device(&dir, "bare", Arc::default());
+    bare.create_group("Other".into(), "PC2".into()).unwrap();
+    bare.add_module(Arc::new(Echo));
+    bare.start(NetworkKind::LocalOnly, None).await.unwrap();
+    let invite = bare.invite(5, false).await.unwrap();
+    let other = device(&dir, "other", Arc::default());
+    other
+        .join(invite.link, "Atlas".into(), NetworkKind::LocalOnly)
+        .await
+        .unwrap();
+    other.start(NetworkKind::LocalOnly, None).await.unwrap();
+    other
+        .add_peer_address("PC2".into(), bare.addresses().await.unwrap().remove(0))
+        .await
+        .unwrap();
+    match other
+        .open_stream("PC2".into(), "test.echo".into(), "{}".into())
+        .await
+    {
+        Err(PasserError::Refused { code, .. }) => assert_eq!(code, "no_indicator"),
+        Err(e) => panic!("unexpected {e:?}"),
+        Ok(_) => panic!("must be refused"),
+    }
+
+    for d in [pc, viewer, bare, other] {
+        d.stop().await;
+    }
+}

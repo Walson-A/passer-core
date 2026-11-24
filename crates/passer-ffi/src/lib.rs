@@ -27,6 +27,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 pub use files::StreamKind;
 use members::MemberCache;
+/// The bus types a Rust host needs for `add_module`, `set_indicator` and `open_stream`.
+pub use passer_bus;
 use passer_bus::{
     Bus, Capability, Ctx, Effect, Event, IndicatorRequirement, Journal, Manifest, Mode, Module,
     ModuleError, Policy, Request, Response, StreamIo,
@@ -34,6 +36,7 @@ use passer_bus::{
 use passer_identity::{DeviceId, Identity, IdentityError, KeyStore};
 use passer_membership::DeviceLog;
 use passer_membership::pairing::Invitation;
+pub use passer_node::OpenStream;
 use passer_node::approval::{ApprovalModule, ApprovalPrompt, Prompter, RemoteApprover};
 use passer_node::{Group, Network, Node, NodeOptions, now_secs};
 use serde_json::Value;
@@ -614,6 +617,74 @@ pub struct PasserDevice {
     /// The push token to publish at the next sync (`Some("")` removes it).
     push: Arc<Mutex<Option<String>>>,
     running: tokio::sync::Mutex<Option<Running>>,
+    /// Modules a Rust host adds directly (see [`PasserDevice::add_module`]).
+    rust_modules: Mutex<Vec<Arc<dyn Module>>>,
+    /// The host's visible sign that a capability is running (see `set_indicator`).
+    indicator: Mutex<Option<Arc<dyn passer_bus::Indicator>>>,
+}
+
+/// For Rust hosts (desktop apps): what UniFFI cannot carry, such as raw byte streams.
+/// Swift and Kotlin apps use the exported API instead.
+impl PasserDevice {
+    /// Adds a module written in Rust (any [`passer_bus::Module`], e.g. `passer_exec::Exec`
+    /// or `passer_files::Files`). Call before `start`.
+    pub fn add_module(&self, module: Arc<dyn Module>) {
+        self.rust_modules.lock().expect("modules lock").push(module);
+    }
+
+    /// The device's indicator: shown while a capability that requires one runs (a screen
+    /// being viewed, say), hidden when its session ends. Without one, such capabilities
+    /// refuse to run. Call before `start`.
+    pub fn set_indicator(&self, indicator: Arc<dyn passer_bus::Indicator>) {
+        *self.indicator.lock().expect("indicator lock") = Some(indicator);
+    }
+
+    /// Opens a stream capability on another member (by name or id): send with
+    /// `io.outgoing`, receive with `io.incoming`, then await `done` for the target's
+    /// result. A refusal (not allowed, approval denied...) is `PasserError::Refused`.
+    pub async fn open_stream(
+        &self,
+        device: String,
+        capability: String,
+        input_json: String,
+    ) -> Result<passer_node::OpenStream, PasserError> {
+        let node = self.node().await?;
+        let id = self.resolve(node.group(), &device)?;
+        let input = parse_input(&input_json)?;
+        let opened = self
+            .reaching(&node, id, || {
+                let (node, input) = (node.clone(), input.clone());
+                let capability = capability.clone();
+                async move {
+                    node.open_stream(
+                        node.peers().addr_of(&id),
+                        Request::stream(&capability, input),
+                    )
+                    .await
+                    .map_err(PasserError::network)
+                }
+            })
+            .await;
+        let journaled = match &opened {
+            Ok(Ok(_)) => Ok(Response::stream_open()),
+            Ok(Err(refusal)) => Ok(refusal.clone()),
+            Err(e) => Err(PasserError::Network {
+                message: e.to_string(),
+            }),
+        };
+        self.journal_outgoing(&node, &id, &capability, &journaled);
+        match opened? {
+            Ok(open) => Ok(open),
+            Err(refusal) => answer(refusal).map(|_| unreachable!("a refusal is an error")),
+        }
+    }
+
+    /// The name of a member, by its id (hex), from this device's verified log.
+    pub fn member_name(&self, id: &str) -> Option<String> {
+        let group = self.load_group().ok()?;
+        let id: DeviceId = id.parse().ok()?;
+        group.membership().members.get(&id).map(|m| m.name.clone())
+    }
 }
 
 impl PasserDevice {
@@ -628,6 +699,8 @@ impl PasserDevice {
             details: Mutex::default(),
             push: Arc::default(),
             running: tokio::sync::Mutex::default(),
+            rust_modules: Mutex::default(),
+            indicator: Mutex::default(),
         })
     }
 
@@ -1050,6 +1123,12 @@ impl PasserDevice {
                 group: group.clone(),
                 incoming: self.home.join("incoming"),
             }));
+        }
+        for module in self.rust_modules.lock().expect("modules lock").iter() {
+            builder = builder.module(module.clone());
+        }
+        if let Some(indicator) = self.indicator.lock().expect("indicator lock").clone() {
+            builder = builder.indicator(indicator);
         }
         let bus = Arc::new(builder.build().map_err(PasserError::invalid)?);
         let options = NodeOptions {

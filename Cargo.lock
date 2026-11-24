@@ -3340,6 +3340,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "passer-exec"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "passer-bus",
+ "passer-identity",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "passer-ffi"
 version = "0.1.0"
 dependencies = [
