@@ -313,7 +313,6 @@ impl InvitationBook {
         authenticated: &DeviceId,
         now: u64,
     ) -> Result<Admission, PairingError> {
-        self.pending.retain(|inv| inv.expires_at > now);
         // Check the name before consuming anything, so a bad name does not burn the
         // invitation. (Uniqueness is checked when the inviter appends to the log.)
         if !crate::is_valid_name(&request.name) {
@@ -340,8 +339,24 @@ impl InvitationBook {
                     && inv.inviter == request.inviter
                     && inv.mac(&request.device, &request.name) == expected
             })
-            .ok_or(PairingError::UnknownInvitation)?;
+            .ok_or(PairingError::UnknownInvitation);
+        // Matched or not, expired invitations go now; one that matched says so.
+        let expired = index
+            .as_ref()
+            .is_ok_and(|&i| self.pending[i].expires_at <= now);
+        let index = match index {
+            Ok(i) if !expired => i,
+            Ok(_) => {
+                self.pending.retain(|inv| inv.expires_at > now);
+                return Err(PairingError::Expired);
+            }
+            Err(e) => {
+                self.pending.retain(|inv| inv.expires_at > now);
+                return Err(e);
+            }
+        };
         let inv = self.pending.remove(index);
+        self.pending.retain(|inv| inv.expires_at > now);
         Ok(Admission {
             device: request.device,
             name: request.name.clone(),
@@ -429,8 +444,14 @@ mod tests {
         let req = JoinRequest::new(&phone, &inv, "iPhone");
         assert_eq!(
             book.redeem(&req, &phone.id(), 100 + 301),
+            Err(PairingError::Expired)
+        );
+        // It is gone: a second try no longer finds it.
+        assert_eq!(
+            book.redeem(&req, &phone.id(), 100 + 302),
             Err(PairingError::UnknownInvitation)
         );
+        assert_eq!(book.pending(), 0);
     }
 
     #[test]
