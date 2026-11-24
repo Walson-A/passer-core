@@ -26,3 +26,9 @@ tracing = "0.1"
 # Optimise dependencies (crypto, QUIC) even in debug builds: tests run much faster.
 [profile.dev.package."*"]
 opt-level = 2
+
+# Smaller libraries for phones.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
