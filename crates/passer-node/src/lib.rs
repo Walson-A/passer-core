@@ -15,6 +15,7 @@
 
 pub mod approval;
 pub mod frame;
+pub mod limit;
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -450,7 +451,22 @@ struct JoinProtocol {
     group: Arc<Group>,
     book: Arc<Mutex<InvitationBook>>,
     on_admitted: Option<AdmissionHook>,
+    /// Failed join attempts, all senders together: keys cost nothing, so a per-key limit
+    /// would stop nobody. Successful joins never count.
+    attempts: Arc<limit::RateLimiter<()>>,
 }
+
+/// Failed join attempts a device tolerates per minute (and at once) before it stops
+/// reading join requests for a while.
+pub const JOINS_PER_MINUTE: u32 = 30;
+const JOIN_BURST: u32 = 10;
+
+#[doc(hidden)]
+pub fn limit_burst_for_tests() -> u32 {
+    JOIN_BURST
+}
+/// QUIC close code for a refused attempt.
+const CLOSE_BUSY: u32 = 429;
 
 impl std::fmt::Debug for JoinProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -461,6 +477,15 @@ impl std::fmt::Debug for JoinProtocol {
 impl ProtocolHandler for JoinProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let remote = connection.remote_id();
+        // No open invitation: nothing to redeem, nothing to read.
+        if !self.book.lock().expect("book lock").has_open(now_secs()) {
+            connection.close(CLOSE_BUSY.into(), b"no open invitation");
+            return Ok(());
+        }
+        if !self.attempts.has_token(&()) {
+            connection.close(CLOSE_BUSY.into(), b"too many join attempts");
+            return Ok(());
+        }
         let Ok(opened) = tokio::time::timeout(frame::READ_TIMEOUT, connection.accept_bi()).await
         else {
             return Ok(());
@@ -504,6 +529,9 @@ impl ProtocolHandler for JoinProtocol {
                 }
             }
         };
+        if matches!(reply, JoinReply::Error { .. }) {
+            self.attempts.allow(&());
+        }
         write_frame(&mut send, &reply)
             .await
             .map_err(AcceptError::from_err)?;
@@ -660,6 +688,7 @@ impl Node {
                     group: group.clone(),
                     book: book.clone(),
                     on_admitted,
+                    attempts: Arc::new(limit::RateLimiter::new(JOINS_PER_MINUTE, JOIN_BURST, 1)),
                 },
             )
             .spawn();
@@ -922,17 +951,30 @@ pub async fn join(
             .connect(addr, JOIN_ALPN)
             .await
             .map_err(|e| anyhow!("connecting to the inviter: {e}"))?;
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| anyhow!("opening a stream: {e}"))?;
-        write_frame(
-            &mut send,
-            &JoinRequest::new(identity, invitation, device_name),
-        )
-        .await?;
-        send.finish()?;
-        let reply: JoinReply = read_frame(&mut recv).await?;
+        // An inviter that hangs up says why (no open invitation, too many attempts).
+        let refused = |e: anyhow::Error| match conn.close_reason() {
+            Some(iroh::endpoint::ConnectionError::ApplicationClosed(close)) => {
+                anyhow!(
+                    "the inviter refused: {}",
+                    String::from_utf8_lossy(&close.reason)
+                )
+            }
+            _ => e,
+        };
+        let exchange = async {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| anyhow!("opening a stream: {e}"))?;
+            write_frame(
+                &mut send,
+                &JoinRequest::new(identity, invitation, device_name),
+            )
+            .await?;
+            send.finish()?;
+            anyhow::Ok(read_frame::<JoinReply>(&mut recv).await?)
+        };
+        let reply = exchange.await.map_err(refused)?;
         conn.close(0u32.into(), b"done");
         match reply {
             JoinReply::Error { message } => bail!("the inviter refused: {message}"),

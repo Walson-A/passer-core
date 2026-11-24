@@ -116,12 +116,9 @@ async fn invitation_cannot_be_reused() {
         Network::LocalOnly,
     )
     .await;
-    assert!(
-        second
-            .unwrap_err()
-            .to_string()
-            .contains("no pending invitation")
-    );
+    // The inviter has no open invitation left: it hangs up and says why.
+    let err = second.unwrap_err().to_string();
+    assert!(err.contains("no open invitation"), "{err}");
     assert_eq!(pc.group().membership().members.len(), 2);
 }
 
@@ -216,4 +213,28 @@ async fn admission_hook_reports_the_same_code() {
         .await
         .unwrap();
     assert_eq!(*seen.lock().unwrap(), Some(("iPhone".to_owned(), sas)));
+}
+
+#[tokio::test]
+async fn join_attempts_are_limited() {
+    let pc_id = Identity::generate();
+    let log = DeviceLog::create(&pc_id, "Walson", "PC", now_secs()).unwrap();
+    let pc = spawn_node(pc_id, log, "PC").await;
+    let invitation = pc.invite(300).unwrap();
+    // Guesses with a forged secret: each is refused, and soon not even read.
+    let mut forged = Invitation::parse_link(&invitation.to_link()).unwrap();
+    forged.secret = [0u8; 32];
+    let mut limited = false;
+    for _ in 0..(passer_node::limit_burst_for_tests() + 5) {
+        let err = join(&Identity::generate(), &forged, "Guess", Network::LocalOnly)
+            .await
+            .unwrap_err()
+            .to_string();
+        if err.contains("too many join attempts") {
+            limited = true;
+            break;
+        }
+    }
+    assert!(limited, "a stream of guesses must be cut off");
+    assert_eq!(pc.group().membership().members.len(), 1);
 }

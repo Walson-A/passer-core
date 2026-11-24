@@ -270,6 +270,12 @@ impl InvitationBook {
         self.pending.len()
     }
 
+    /// Whether any invitation is still valid at `now`: without one, a join cannot succeed
+    /// and need not even be read.
+    pub fn has_open(&self, now: u64) -> bool {
+        self.pending.iter().any(|inv| inv.expires_at > now)
+    }
+
     /// Checks a join request. `authenticated` is the key the transport proved the remote
     /// holds. On success the invitation is consumed: a second use fails.
     pub fn redeem(

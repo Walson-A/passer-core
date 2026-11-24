@@ -300,9 +300,46 @@ impl State {
     }
 }
 
+/// Publishes accepted per device per minute (devices sync every 30 s), and at once.
+pub const PUBLISHES_PER_MINUTE: u32 = 12;
+const PUBLISH_BURST: u32 = 6;
+/// Wake requests accepted per requesting device per minute (the target is limited too).
+pub const WAKES_PER_MINUTE: u32 = 10;
+/// Devices tracked by the limiters before new ones are refused (idle ones are forgotten).
+const LIMITED_KEYS: usize = 100_000;
+
+/// Limits shared by the server's protocols.
+#[derive(Clone)]
+struct Limits {
+    publishes: Arc<passer_node::limit::RateLimiter<DeviceId>>,
+    wakes: Arc<passer_node::limit::RateLimiter<DeviceId>>,
+    /// Log verifications running at once: each can check thousands of signatures.
+    verifying: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
+        Self {
+            publishes: Arc::new(passer_node::limit::RateLimiter::new(
+                PUBLISHES_PER_MINUTE,
+                PUBLISH_BURST,
+                LIMITED_KEYS,
+            )),
+            wakes: Arc::new(passer_node::limit::RateLimiter::new(
+                WAKES_PER_MINUTE,
+                WAKES_PER_MINUTE,
+                LIMITED_KEYS,
+            )),
+            verifying: Arc::new(tokio::sync::Semaphore::new(cpus * 2)),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct CoordProtocol {
     state: State,
+    limits: Limits,
 }
 
 impl std::fmt::Debug for CoordProtocol {
@@ -318,11 +355,22 @@ impl ProtocolHandler for CoordProtocol {
             return Ok(());
         };
         let (mut send, mut recv) = opened?;
-        let reply = match read_frame::<Publish>(&mut recv).await {
-            Ok(msg) => self.state.publish(from, msg, now_secs()).await,
-            Err(e) => Reply::Error {
-                message: e.to_string(),
-            },
+        let reply = if !self.limits.publishes.allow(&from) {
+            Reply::Error {
+                message: "too many requests: sync less often".into(),
+            }
+        } else {
+            match read_frame::<Publish>(&mut recv).await {
+                Ok(msg) => match self.limits.verifying.clone().try_acquire_owned() {
+                    Ok(_permit) => self.state.publish(from, msg, now_secs()).await,
+                    Err(_) => Reply::Error {
+                        message: "the server is busy: try again shortly".into(),
+                    },
+                },
+                Err(e) => Reply::Error {
+                    message: e.to_string(),
+                },
+            }
         };
         write_frame(&mut send, &reply)
             .await
@@ -337,6 +385,7 @@ impl ProtocolHandler for CoordProtocol {
 struct WakeProtocol {
     state: State,
     hook: wake::Hook,
+    limits: Limits,
 }
 
 impl std::fmt::Debug for WakeProtocol {
@@ -353,6 +402,9 @@ impl ProtocolHandler for WakeProtocol {
         };
         let (mut send, mut recv) = opened?;
         let reply = match read_frame::<WakeRequest>(&mut recv).await {
+            Ok(_) if !self.limits.wakes.allow(&from) => WakeReply::Error {
+                message: "too many wake requests".into(),
+            },
             Ok(req) => self.state.wake(from, req, now_secs(), &self.hook).await,
             Err(e) => WakeReply::Error {
                 message: e.to_string(),
@@ -395,11 +447,13 @@ impl Server {
             .await
             .map_err(|e| anyhow!("binding: {e}"))?;
         let state = State::default();
+        let limits = Limits::default();
         let router = Router::builder(endpoint)
             .accept(
                 COORD_ALPN,
                 CoordProtocol {
                     state: state.clone(),
+                    limits: limits.clone(),
                 },
             )
             .accept(
@@ -407,6 +461,7 @@ impl Server {
                 WakeProtocol {
                     state: state.clone(),
                     hook,
+                    limits,
                 },
             )
             .spawn();

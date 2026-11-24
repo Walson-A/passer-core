@@ -27,7 +27,7 @@ The content devices exchange (files, clipboard, screen), the ability to act on a
 | | send a file outside the receiving folder, or overwrite one | `file.drop` keeps the base name only (no separators, `.`/`..`, reserved Windows names, control or bidi characters), never overwrites, writes complete files only; `file.get` serves only regular files directly in the shared folder, after resolving links | in place |
 | | make a device believe a cut transfer is complete | stream chunks end with an explicit marker; a stream that stops without it is broken, its partial file deleted | in place |
 | | wake someone else's phone, or every few seconds | wake requests only between members of the same group, verified against the signed log; at most one push per device every 15 s; the server never sees why | in place |
-| Resource exhaustion | memory, CPU, tasks | frames ≤ 1 MiB and stream chunks ≤ 256 KiB read incrementally, bounded buffers both ways (backpressure); a silent stream breaks after 60 s; uploads bounded per capability (4 GiB by default); logs ≤ 4096 entries; server checks signatures off-lock on blocking threads, per-group locks, ≤ 100 000 groups | partial (no rate limiting of joins and publishes yet) |
+| Resource exhaustion | memory, CPU, tasks | frames ≤ 1 MiB and stream chunks ≤ 256 KiB read incrementally, bounded buffers both ways (backpressure); a silent stream breaks after 60 s; uploads bounded per capability (4 GiB by default); logs ≤ 4096 entries; server checks signatures off-lock on blocking threads, per-group locks, ≤ 100 000 groups; join requests read only while an invitation is open, and no more after 30 failed attempts per minute; publishes 12 per minute per device, log verifications bounded by the server's CPUs; wake requests 10 per minute per requester | in place (limits per key: keys are free, so a flood from many keys is bounded by the server's capacity, not stopped) |
 | Supply chain | poisoned dependency | locked dependencies, `cargo-deny` policy, few dependencies in the trust core | config in repo |
 
 ## Principles
@@ -101,7 +101,9 @@ An independent review (separate from the author of the code) reported 12 finding
 - **Log updates** travel through the coordination server or a peer when a device syncs
   (every 30 s). A device that never saw an update cannot detect that the server withholds
   it; gossip between devices would reduce this. The server sees metadata (keys, device
-  names, IPs, online times). No rate limiting of joins and publishes yet.
+  names, IPs, online times. Requests are rate-limited per device key; since keys cost
+  nothing, a flood from many keys is bounded by the server's verification capacity, not
+  stopped.
 - **Fork choice with three or more concurrent branches** is decided pairwise; the rule is
   antisymmetric (tested) but its transitivity across many branches is not proven.
 - **Look-alike names** from other scripts (Cyrillic "РС" vs Latin "PC") are not caught;
