@@ -41,7 +41,7 @@ it will come.
   `NetworkKind::Relay { url }` and the server's address.
 
 - **Waking a sleeping phone**: the app passes its push token to `set_push_token`, as
-  `apns:<hex device token>`; the coordination server keeps it and, when another member
+  `apns:<hex device token>` (iOS) or `fcm:<registration token>` (Android); the coordination server keeps it and, when another member
   cannot reach the phone, hands it to the push gateway (`passer-push`, see
   [`self-hosting.md`](self-hosting.md)), which sends a silent notification. `call`,
   `send_file` and `fetch_file` retry for a few seconds meanwhile. On the iPhone, the app
@@ -63,7 +63,6 @@ it will come.
 | A stable API (still 0.x) | the protocol and the types will change; apps built today will break | freeze the wire protocol and the `passer-ffi` surface, then semantic versioning |
 | Published packages | no crates.io release, no Swift Package / XCFramework, no Android AAR on Maven | release builds of `passer-ffi` with the generated bindings for each platform |
 | An external security audit | the code was reviewed, not audited | required before 1.0 |
-| Android wake-ups | `passer-push` sends APNs only | FCM in the gateway |
 | Approvals on a sleeping phone | an approval waits 60 s; a woken phone must show it in time | needs the app's notification handling, then real-device testing |
 | Streams beyond files | screens and audio need datagrams or timed frames | with the screen project |
 | A hosted relay and coordination service | self-hosting works today; a service for people who will not run a server does not exist yet | Passer's service |

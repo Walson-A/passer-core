@@ -20,7 +20,9 @@ tracing = { workspace = true }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 # ring, like iroh: no C toolchain beyond what the rest of the workspace needs.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "json", "form"] }
+# RSA signatures for FCM (constant-time; the `rsa` crate is not).
+ring = "0.17"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }

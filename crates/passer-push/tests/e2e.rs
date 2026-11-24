@@ -62,6 +62,7 @@ async fn gateway(apple: &str) -> String {
     let gateway = Arc::new(Gateway {
         secret: SECRET.into(),
         apns: Some(Apns::new(auth, "direct.passer.app", apple).unwrap()),
+        fcm: None,
     });
     format!("http://{}/wake", serve(router(gateway)).await)
 }
@@ -139,7 +140,11 @@ async fn the_gateway_only_obeys_its_server() {
         401
     );
     assert_eq!(post(SECRET, "apns:not-hex!").await.unwrap().status(), 502);
-    assert_eq!(post(SECRET, "fcm:abcd").await.unwrap().status(), 502);
+    assert_eq!(
+        post(SECRET, "fcm:abcd").await.unwrap().status(),
+        502,
+        "no Firebase account here"
+    );
     assert_eq!(post(SECRET, "abcd").await.unwrap().status(), 502);
     assert!(apple.0.lock().unwrap().is_empty(), "nothing reached Apple");
     assert_eq!(post(SECRET, "apns:abcd").await.unwrap().status(), 200);

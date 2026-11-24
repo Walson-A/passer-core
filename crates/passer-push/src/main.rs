@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
-use passer_push::{APNS_PRODUCTION, APNS_SANDBOX, Apns, ApnsAuth, Gateway, router};
+use passer_push::{APNS_PRODUCTION, APNS_SANDBOX, Apns, ApnsAuth, FCM_BASE, Fcm, Gateway, router};
 
 #[derive(Parser)]
 #[command(name = "passer-push", version, about = "Push gateway for passer-core")]
@@ -43,6 +43,9 @@ struct Cli {
     /// Use Apple's sandbox (development builds) instead of production.
     #[arg(long, env = "PASSER_PUSH_APNS_SANDBOX")]
     apns_sandbox: bool,
+    /// Firebase service account file, to wake Android phones.
+    #[arg(long, env = "PASSER_PUSH_FCM_ACCOUNT")]
+    fcm_account: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -79,12 +82,21 @@ async fn main() -> anyhow::Result<()> {
         }
         None => None,
     };
-    if apns.is_none() {
-        eprintln!("No APNs key: every wake request will fail. Pass --apns-key.");
+    let fcm = match &cli.fcm_account {
+        Some(path) => {
+            let json = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            Some(Fcm::new(&json, FCM_BASE)?)
+        }
+        None => None,
+    };
+    if apns.is_none() && fcm.is_none() {
+        eprintln!("No APNs key and no Firebase account: every wake request will fail.");
     }
     let gateway = Arc::new(Gateway {
         secret: cli.secret,
         apns,
+        fcm,
     });
     let listener = tokio::net::TcpListener::bind(cli.listen).await?;
     println!("passer-push listening on http://{}/wake", cli.listen);

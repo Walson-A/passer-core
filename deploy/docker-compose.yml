@@ -45,6 +45,9 @@ services:
       PASSER_PUSH_APNS_TOPIC: ${PASSER_PUSH_APNS_TOPIC:-direct.passer.app}
     volumes:
       - ./apns.p8:/secrets/apns.p8:ro
+      # Android: uncomment both lines, with the Firebase service account saved here.
+      # - ./fcm-account.json:/secrets/fcm-account.json:ro
+    # environment PASSER_PUSH_FCM_ACCOUNT: /secrets/fcm-account.json (add it above)
 
 volumes:
   relay-data:

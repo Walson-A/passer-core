@@ -5,8 +5,8 @@
 //! (`passer-coord --wake-url http://<this>/wake --wake-secret <secret>`), and this gateway,
 //! run by the app's vendor, sends the push.
 //!
-//! Tokens say which service they belong to: `apns:<hex device token>` for iPhones and iPads.
-//! (`fcm:` for Android is not implemented yet.) The app registers its token with
+//! Tokens say which service they belong to: `apns:<hex device token>` for iPhones and iPads,
+//! `fcm:<registration token>` for Android. The app registers its token with
 //! `PasserDevice::set_push_token`.
 //!
 //! The push is a background notification with no content (`content-available`): it wakes
@@ -28,6 +28,9 @@ use p256::pkcs8::DecodePrivateKey;
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
+pub mod fcm;
+pub use fcm::{FCM_BASE, Fcm};
+
 /// Apple's production and development (sandbox) endpoints. Builds installed from Xcode or
 /// EAS development profiles use the sandbox; TestFlight and the App Store use production.
 pub const APNS_PRODUCTION: &str = "https://api.push.apple.com";
@@ -38,7 +41,7 @@ const JWT_LIFETIME_SECS: u64 = 50 * 60;
 /// Largest request body accepted on `/wake`.
 const MAX_BODY: usize = 8 * 1024;
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -157,6 +160,7 @@ pub struct Gateway {
     /// The bearer secret `passer-coord --wake-secret` sends.
     pub secret: String,
     pub apns: Option<Apns>,
+    pub fcm: Option<Fcm>,
 }
 
 #[derive(Deserialize)]
@@ -173,7 +177,10 @@ impl Gateway {
                 Some(apns) => apns.wake(device).await,
                 None => bail!("this gateway has no APNs key"),
             },
-            Some(("fcm", _)) => bail!("Android (FCM) is not supported yet"),
+            Some(("fcm", token)) => match &self.fcm {
+                Some(fcm) => fcm.wake(token).await,
+                None => bail!("this gateway has no Firebase service account"),
+            },
             _ => bail!("unknown token kind"),
         }
     }

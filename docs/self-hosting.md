@@ -71,7 +71,6 @@ Relaying costs bandwidth. `relay.toml` can restrict it to your devices' ids
 
 - One server for many users (accounts, quotas): the code supports many groups per server
   (`MAX_GROUPS`), not billing or abuse handling.
-- Android (FCM) in the push gateway: only iPhones and iPads (APNs) can be woken today.
 
 ## Waking sleeping phones (optional)
 
@@ -93,12 +92,16 @@ exposed to the internet.
    PASSER_COORD_WAKE_URL=http://push:8080/wake
    ```
 
-3. `docker compose --profile push up -d --build`.
+3. For Android phones too: in the Firebase console, Project settings > Service accounts >
+   Generate new private key; save it as `deploy/fcm-account.json` (git ignores it) and
+   uncomment its two lines in `docker-compose.yml`.
+4. `docker compose --profile push up -d --build`.
 
 Without Docker: `passer-push --secret <s> --apns-key key.p8 --apns-key-id <id>
 --apns-team-id <team> --apns-topic <bundle id>` (add `--apns-sandbox` for development
-builds), and `passer-coord --wake-url http://127.0.0.1:8080/wake --wake-secret <s>`.
+builds; `--fcm-account service-account.json` for Android), and `passer-coord --wake-url http://127.0.0.1:8080/wake --wake-secret <s>`.
 
-The gateway sends background notifications without content (`content-available`). iOS
-delivers them on a best-effort basis: usually within seconds, later in Low Power Mode or
-when an app is woken too often.
+The gateway sends notifications without content: a background push on iOS
+(`content-available`), a high-priority data message on Android. iOS delivers background
+pushes on a best-effort basis: usually within seconds, later in Low Power Mode or when an
+app is woken too often. Android may defer them for apps the system restricts.

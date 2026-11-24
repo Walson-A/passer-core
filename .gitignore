@@ -7,4 +7,5 @@ fuzz/Cargo.lock
 
 # Secrets for the deployment: never committed.
 *.p8
+deploy/fcm-account.json
 deploy/.env
