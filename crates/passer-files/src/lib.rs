@@ -4,6 +4,7 @@
 //!   under its base name, never overwriting (`photo (1).jpg`).
 //! - `file.get` (read): the caller gets a file from this device's shared folder, by name.
 //!   Only files directly in that folder: no paths, no links leading out of it.
+//! - `file.list` (read): what that folder holds (names, sizes, dates), newest first.
 //!
 //! The bus decides who may call them (by default member devices may, agents may not), and
 //! journals every transfer without its content. A transfer that breaks leaves nothing
@@ -18,6 +19,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const DROP: &str = "file.drop";
 pub const GET: &str = "file.get";
+pub const LIST: &str = "file.list";
+/// Most files `file.list` returns.
+pub const MAX_LISTED: usize = 500;
 
 /// Largest file `file.drop` accepts unless told otherwise.
 pub const DEFAULT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -137,6 +141,38 @@ fn failed(e: impl std::fmt::Display) -> ModuleError {
     ModuleError::Failed(e.to_string())
 }
 
+/// Regular, visible files directly in `dir`, newest first, at most [`MAX_LISTED`]. Links
+/// are left out: `file.get` would refuse them anyway if they lead outside.
+fn list(dir: &Path) -> Vec<Value> {
+    let mut files: Vec<(u64, Value)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            let name = entry.file_name().into_string().ok()?;
+            if !meta.is_file()
+                || name.starts_with('.')
+                || safe_name(&name).as_deref() != Some(&name)
+            {
+                return None;
+            }
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Some((
+                modified,
+                json!({ "name": name, "size": meta.len(), "modified": modified }),
+            ))
+        })
+        .collect();
+    files.sort_by_key(|f| std::cmp::Reverse(f.0));
+    files.into_iter().take(MAX_LISTED).map(|(_, v)| v).collect()
+}
+
 impl Files {
     async fn receive(&self, input: Value, io: StreamIo) -> Result<Value, ModuleError> {
         let inbox = self
@@ -233,6 +269,13 @@ impl Module for Files {
             ));
         }
         if self.shared.is_some() {
+            capabilities.push(Capability::call(
+                LIST,
+                "List shared files",
+                "Lists the files in this device's shared folder (name, size, modification                  time), newest first, to get one with file.get.",
+                Effect::Read,
+                json!({ "type": "object", "additionalProperties": false }),
+            ));
             capabilities.push(stream(
                 GET,
                 "Get a shared file",
@@ -248,9 +291,18 @@ impl Module for Files {
     }
 
     async fn invoke(&self, _: Ctx, capability: &str, _: Value) -> Result<Value, ModuleError> {
-        Err(ModuleError::Unsupported(format!(
-            "`{capability}` is a stream"
-        )))
+        match (capability, &self.shared) {
+            (LIST, Some(dir)) => {
+                let dir = dir.clone();
+                let files = tokio::task::spawn_blocking(move || list(&dir))
+                    .await
+                    .map_err(failed)?;
+                Ok(json!({ "files": files }))
+            }
+            _ => Err(ModuleError::Unsupported(format!(
+                "`{capability}` is not a call here"
+            ))),
+        }
     }
 
     async fn invoke_stream(
@@ -288,6 +340,19 @@ mod tests {
         assert_eq!(safe_name("a\u{202E}gpj.exe").as_deref(), Some("a_gpj.exe"));
         assert_eq!(safe_name("what?.txt").as_deref(), Some("what_.txt"));
         assert!(safe_name(&"x".repeat(500)).unwrap().len() <= MAX_NAME);
+    }
+
+    #[test]
+    fn listing_shows_what_file_get_serves() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.pdf"), b"12345").unwrap();
+        std::fs::write(dir.path().join(".hidden"), b"x").unwrap();
+        std::fs::write(dir.path().join(".photo.jpg.42.part"), b"x").unwrap();
+        std::fs::create_dir(dir.path().join("folder")).unwrap();
+        let files = list(dir.path());
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0]["name"], "notes.pdf");
+        assert_eq!(files[0]["size"], 5);
     }
 
     #[test]

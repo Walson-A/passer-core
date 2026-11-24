@@ -24,7 +24,7 @@ it will come.
   code only does the work.
 
 - **Files between devices**: in Rust, add `passer_files::Files` (an inbox, a shared
-  folder) to your bus. Through `passer-ffi`, declare a `CapabilitySpec` with
+  folder) to your bus: `file.drop`, `file.list` and `file.get`. Through `passer-ffi`, declare a `CapabilitySpec` with
   `stream: Some(StreamKind::Upload)` or `Download`: the core receives the bytes into a
   private file and hands its path to `CapabilityHandler::receive_file` once complete, or
   streams the file `provide_file` names. Callers use `send_file` and `fetch_file`, with a

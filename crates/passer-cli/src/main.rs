@@ -8,6 +8,7 @@
 //! passer-core call PC device.info                  # from either one
 //! passer-core serve --inbox ~/Inbox --share ~/Public  # receive files, share a folder
 //! passer-core send PC ./video.mp4                  # from another member
+//! passer-core files PC                           # what PC shares
 //! passer-core get PC notes.pdf --to ./notes.pdf
 //! ```
 //!
@@ -109,6 +110,12 @@ enum Command {
         /// Name to give it there (defaults to its own name).
         #[arg(long = "as")]
         name: Option<String>,
+        #[arg(long)]
+        addr: Vec<String>,
+    },
+    /// Lists the files another member shares (`file.list`).
+    Files {
+        device: String,
         #[arg(long)]
         addr: Vec<String>,
     },
@@ -226,8 +233,23 @@ impl Home {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// One command per run, on a thread with room for it: Windows gives the main thread 1 MiB
+/// of stack, too little for the command dispatcher in debug builds.
+fn main() -> anyhow::Result<()> {
+    std::thread::Builder::new()
+        .name("passer-core".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(run())
+        })?
+        .join()
+        .map_err(|_| anyhow::anyhow!("the command panicked"))?
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let home = Home::resolve(cli.home)?;
     let network: Network = network(cli.network, cli.relay.as_deref())?;
@@ -454,6 +476,33 @@ async fn main() -> anyhow::Result<()> {
             node.shutdown().await?;
             match response? {
                 Response::Ok { output } => println!("{}", serde_json::to_string_pretty(&output)?),
+                Response::Error { code, message } => bail!("{}: {message}", code.as_str()),
+            }
+        }
+        Command::Files { device, addr } => {
+            let (node, peer) =
+                client(identity, &home, network, &device, &addr, coord.as_ref()).await?;
+            let response = node
+                .call(
+                    peer,
+                    Request::new(passer_files::LIST, serde_json::json!({})),
+                )
+                .await;
+            node.shutdown().await?;
+            match response? {
+                Response::Ok { output } => {
+                    let files = output["files"].as_array().cloned().unwrap_or_default();
+                    if files.is_empty() {
+                        println!("{device} shares no files.");
+                    }
+                    for f in files {
+                        println!(
+                            "{:>12}  {}",
+                            f["size"].as_u64().unwrap_or(0),
+                            f["name"].as_str().unwrap_or("?")
+                        );
+                    }
+                }
                 Response::Error { code, message } => bail!("{}: {message}", code.as_str()),
             }
         }
