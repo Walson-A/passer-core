@@ -15,6 +15,10 @@ permissions:
 jobs:
   ios:
     runs-on: macos-latest
+    env:
+      # The app's minimum iOS. Without it, the C parts (ring) target the runner's SDK
+      # version, and the linker warns that they need a newer iOS than the app.
+      IPHONEOS_DEPLOYMENT_TARGET: "17.0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
