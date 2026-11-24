@@ -539,6 +539,8 @@ pub struct PasserDevice {
     admissions: Mutex<Option<Arc<dyn AdmissionListener>>>,
     details: Mutex<passer_device_info::Details>,
     cache: Arc<MemberCache>,
+    /// The push token to publish at the next sync (`Some("")` removes it).
+    push: Arc<Mutex<Option<String>>>,
     running: tokio::sync::Mutex<Option<Running>>,
 }
 
@@ -552,8 +554,52 @@ impl PasserDevice {
             prompter: Mutex::default(),
             admissions: Mutex::default(),
             details: Mutex::default(),
+            push: Arc::default(),
             running: tokio::sync::Mutex::default(),
         })
+    }
+
+    /// Runs `attempt`; if the device cannot be reached and a coordination server is
+    /// configured, asks the server to wake it (a push to the phone) and tries again for a
+    /// few seconds. Only connecting is retried, never a transfer under way.
+    async fn reaching<T, F, Fut>(
+        &self,
+        node: &Arc<Node>,
+        device: DeviceId,
+        attempt: F,
+    ) -> Result<T, PasserError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, PasserError>>,
+    {
+        let first = attempt().await;
+        if !matches!(first, Err(PasserError::Network { .. })) {
+            return first;
+        }
+        let server = self
+            .running
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|r| r.coord.clone());
+        let Some(server) = server else {
+            return first;
+        };
+        if !passer_coord::wake(node, server, device)
+            .await
+            .unwrap_or(false)
+        {
+            return first;
+        }
+        let mut last = first;
+        for secs in [2, 3, 4, 5, 6] {
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            last = attempt().await;
+            if !matches!(last, Err(PasserError::Network { .. })) {
+                return last;
+            }
+        }
+        last
     }
 
     fn journal_path(&self) -> PathBuf {
@@ -953,7 +999,12 @@ impl PasserDevice {
                 .map_err(PasserError::network)?,
         );
         let sync_loop = coord.clone().map(|server| {
-            passer_coord::spawn_sync_loop(node.clone(), server, Duration::from_secs(30))
+            passer_coord::spawn_sync_loop_with(
+                node.clone(),
+                server,
+                Duration::from_secs(30),
+                self.push.clone(),
+            )
         });
         // What the other members are and offer, for the UI: in the background, so that
         // `start` does not wait for devices that are asleep.
@@ -1039,11 +1090,17 @@ impl PasserDevice {
         let node = self.node().await?;
         let id = self.resolve(node.group(), &device)?;
         let input = parse_input(&input_json)?;
-        let addr = node.peers().addr_of(&id);
-        let result = node
-            .call(addr, Request::new(&capability, input))
-            .await
-            .map_err(PasserError::network);
+        let result = self
+            .reaching(&node, id, || {
+                let (node, input) = (node.clone(), input.clone());
+                let capability = capability.clone();
+                async move {
+                    node.call(node.peers().addr_of(&id), Request::new(&capability, input))
+                        .await
+                        .map_err(PasserError::network)
+                }
+            })
+            .await;
         self.journal_outgoing(&node, &id, &capability, &result);
         answer(result?)
     }
@@ -1062,14 +1119,22 @@ impl PasserDevice {
         let node = self.node().await?;
         let id = self.resolve(node.group(), &device)?;
         let input = parse_input(&input_json)?;
-        let opened = node
-            .open_stream(
-                node.peers().addr_of(&id),
-                Request::stream(&capability, input),
-            )
+        let opened = self
+            .reaching(&node, id, || {
+                let (node, input) = (node.clone(), input.clone());
+                let capability = capability.clone();
+                async move {
+                    node.open_stream(
+                        node.peers().addr_of(&id),
+                        Request::stream(&capability, input),
+                    )
+                    .await
+                    .map_err(PasserError::network)
+                }
+            })
             .await;
         let result = match opened {
-            Err(e) => Err(PasserError::network(e)),
+            Err(e) => Err(e),
             Ok(Err(refusal)) => Ok(refusal),
             Ok(Ok(open)) => {
                 let passer_node::OpenStream { io, done } = open;
@@ -1111,14 +1176,22 @@ impl PasserDevice {
         let mut part = destination.clone().into_os_string();
         part.push(".part");
         let part = PathBuf::from(part);
-        let opened = node
-            .open_stream(
-                node.peers().addr_of(&id),
-                Request::stream(&capability, input),
-            )
+        let opened = self
+            .reaching(&node, id, || {
+                let (node, input) = (node.clone(), input.clone());
+                let capability = capability.clone();
+                async move {
+                    node.open_stream(
+                        node.peers().addr_of(&id),
+                        Request::stream(&capability, input),
+                    )
+                    .await
+                    .map_err(PasserError::network)
+                }
+            })
             .await;
         let result = match opened {
-            Err(e) => Err(PasserError::network(e)),
+            Err(e) => Err(e),
             Ok(Err(refusal)) => Ok(refusal),
             Ok(Ok(open)) => {
                 let passer_node::OpenStream { io, done } = open;
@@ -1148,6 +1221,14 @@ impl PasserDevice {
         answer(result?)
     }
 
+    /// The push token the system gave this app (APNs, FCM), so that other members can
+    /// wake this device through the coordination server when it sleeps; `None` stops
+    /// that. Published at the next sync (`sync` publishes it now). When woken, start the
+    /// device for a moment so it can answer.
+    pub fn set_push_token(&self, token: Option<String>) {
+        *self.push.lock().expect("push lock") = Some(token.unwrap_or_default());
+    }
+
     /// Exchanges logs and addresses with the coordination server now.
     pub async fn sync(&self) -> Result<(), PasserError> {
         let running = self.running.lock().await;
@@ -1156,7 +1237,8 @@ impl PasserDevice {
             .coord
             .clone()
             .ok_or_else(|| PasserError::invalid("no coordination server configured"))?;
-        passer_coord::sync(&r.node, server)
+        let token = self.push.lock().expect("push lock").clone();
+        passer_coord::sync_with(&r.node, server, token)
             .await
             .map_err(PasserError::network)?;
         Ok(())

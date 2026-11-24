@@ -71,4 +71,8 @@ Relaying costs bandwidth. `relay.toml` can restrict it to your devices' ids
 
 - One server for many users (accounts, quotas): the code supports many groups per server
   (`MAX_GROUPS`), not billing or abuse handling.
-- Push notifications to wake a sleeping phone: see `docs/integrating.md`.
+- A push gateway. To wake sleeping phones, run one next to the server and start it with
+  `passer-coord --wake-url http://gateway:8080/wake --wake-secret <secret>`
+  (`PASSER_COORD_WAKE_URL`, `PASSER_COORD_WAKE_SECRET`). The gateway receives
+  `POST {"token": "...", "group": "..."}` and sends a silent push with your Apple or Google
+  credentials. See `docs/integrating.md`.

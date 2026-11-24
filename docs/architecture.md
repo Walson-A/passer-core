@@ -6,8 +6,8 @@ invoke capabilities, with one permission checkpoint. What devices actually do li
 of the whole depends on it.* Anything else is a module, often in its own repository.
 
 ```text
- Bridges     MCP (planned) · app intents · CLI
- Modules     device-info (example, here) · transfer (Passer) · screen (separate project)
+ Bridges     MCP · app intents · CLI
+ Modules     device-info · files (here) · clipboard (Passer) · screen (separate project)
  L3 Bus      declare · validate · policy · approve · indicator · lease · journal
  L2 Node     iroh endpoint (key = device), ALPNs: bus / log / join
  L1 Members  signed device log · invitations · revocation
@@ -20,8 +20,9 @@ of the whole depends on it.* Anything else is a module, often in its own reposit
   transport therefore authenticates exactly the key the membership log names.
 - Every signature carries a context string (`membership/entry/v1`, `membership/join/v1`)
   and is length-framed, so no signature can be replayed for another purpose.
-- `KeyStore` abstracts where the private key lives. Only `FileKeyStore` (development) exists
-  today; platform vaults are planned (see `security.md`).
+- `KeyStore` abstracts where the private key lives: DPAPI on Windows, the Keychain on
+  macOS, the Secret Service on Linux (`platform_store` picks), the app's own vault on iOS
+  and Android (`KeyVault` in `passer-ffi`), a file for tests (see `security.md`).
 
 ## L1 — Membership (`passer-membership`)
 
@@ -71,13 +72,20 @@ One iroh endpoint per device, keyed by its identity. Three protocols, one ALPN e
 
 | ALPN | Who may connect | What happens |
 |---|---|---|
-| `passer-core/bus/1` | members only (checked at accept, then again per request) | one request/response per bidirectional stream |
+| `passer-core/bus/1` | members only (checked at accept, then again per request) | one request/response, or one stream, per bidirectional QUIC stream |
 | `passer-core/log/1` | members only | returns the current device log |
 | `passer-core/join/1` | anyone | redeems an invitation, or nothing |
 
 Frames are a 4-byte big-endian length (≤ 1 MiB, checked before allocating) followed by
-JSON. Network modes: `LocalOnly` (direct addresses, used by tests) and `N0Dev` (n0's public
-relays and address lookup — development only; production will run its own `iroh-relay`).
+JSON. A stream (`Request.stream = true`) starts the same way; once the target accepts
+(`{"stream":"open"}`), both sides send binary chunks (same length prefix, ≤ 256 KiB) and a
+zero length to say they are done, then the target sends its result as a last frame. A
+stream that stops without the end marker is broken, never complete.
+
+Network modes: `LocalOnly` (direct addresses, used by tests), `Relay(url)` (a relay you run,
+see `self-hosting.md`) and `N0Dev` (n0's public relays and address lookup, development
+only). Invitations carry the inviter's direct addresses and relay; the coordination server
+passes along each member's.
 
 ## L3 — Capability bus (`passer-bus`)
 
@@ -85,10 +93,12 @@ A `Capability` declares `name`, `title`, `description`, `input_schema` (JSON Sch
 optional `output_schema`, `effect` (`read` / `write` / `sensitive`), `mode` (`call` /
 `stream`), optional `target_kind` (e.g. `app`) and an `indicator` requirement.
 
-`Bus::handle(subject, request)` runs, in order:
+`Bus::handle(subject, request)` (calls) and `Bus::open(subject, request, Mode::Stream)`
+(streams, then `Session::run_stream`) run, in order:
 
 1. **membership** of the authenticated device;
-2. **lookup**, target consistency, **schema validation** (no remote `$ref` resolution);
+2. **lookup**, **mode** (a capability only runs as what it declares), target consistency,
+   **schema validation** (no remote `$ref` resolution);
 3. **policy**: ordered rules `(who, capability pattern, target) → allow | ask | deny`, with
    a lease length. Defaults: member devices may read and write; sensitive asks; agents get
    nothing unless granted. Sensitive leases are capped at 15 minutes;
@@ -128,9 +138,14 @@ device that joins (`invite_approver`); the joining device cannot change it.
 
 ## Server half — coordination (`passer-coord`)
 
-One protocol, `passer-core/coord/1`, one message: a device publishes its device log and its
-direct addresses; the server answers with the group's current log and the presence of the
-other members seen in the last 5 minutes.
+`passer-core/coord/1`, one message: a device publishes its device log, its direct
+addresses, its relay and (optionally) a push token; the server answers with the group's
+current log and the presence of the other members seen in the last 5 minutes.
+
+`passer-core/wake/1`: a member asks the server to wake another member of the same group.
+The server checks both against the signed log, sends at most one push per device every
+15 s, and hands the stored token to its `WakeHook` (an HTTP POST to a push gateway the app
+vendor runs). It never learns why.
 
 - The server keeps, per group, whichever log **extends** the other; it refuses logs that do
   not verify and forks of the history it holds. It cannot write a log entry itself.
@@ -158,8 +173,8 @@ pinned to the bridge device.
 
 ## Planned next
 
-- Streams (file transfer) on the bus; video stays WebRTC in the screen project, with the
-  bus for identity, permission and signalling.
-- Platform key stores, hardware-bound root key; UniFFI bindings for iOS and Android.
-- Push notifications so approvals reach a sleeping phone; push of log updates (today:
-  pull with `sync`).
+- Video and audio stay WebRTC in the screen project, with the bus for identity,
+  permission and signalling.
+- A hardware-bound root key (Secure Enclave, TPM) signing a rotatable transport key.
+- A reference push gateway; push of log updates (today: pull with `sync`).
+- Freezing the wire protocol and the `passer-ffi` surface for 1.0.

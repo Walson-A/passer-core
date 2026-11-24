@@ -21,7 +21,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
+async-trait = "0.1"
 
 [dev-dependencies]
 # A real relay in tests (self-signed certificate).

@@ -32,6 +32,10 @@ use passer_node::frame::{READ_TIMEOUT, read_frame, write_frame};
 use passer_node::{Node, now_secs};
 use serde::{Deserialize, Serialize};
 
+mod wake;
+pub use wake::{HttpWakeHook, MAX_TOKEN, WAKE_ALPN, WAKE_INTERVAL_SECS, WakeHook, wake};
+use wake::{WakeReply, WakeRequest};
+
 pub const COORD_ALPN: &[u8] = b"passer-core/coord/1";
 /// A device not seen for this long is reported offline.
 pub const PRESENCE_TTL_SECS: u64 = 5 * 60;
@@ -56,6 +60,10 @@ struct Publish {
     addrs: Vec<SocketAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     relay: Option<String>,
+    /// The device's push token, to wake it later: `None` leaves the stored one, an
+    /// empty string removes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    push: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -79,6 +87,9 @@ pub enum Reply {
 struct GroupState {
     log: Option<DeviceLog>,
     presence: HashMap<DeviceId, Presence>,
+    /// Push tokens, never sent to anyone but the wake hook.
+    push: HashMap<DeviceId, String>,
+    last_wake: HashMap<DeviceId, u64>,
 }
 
 /// Most groups one server keeps. A hosted service adds accounts and quotas on top.
@@ -201,7 +212,18 @@ impl State {
                 seen_at: now,
             },
         );
+        match msg.push {
+            Some(token) if token.is_empty() => {
+                g.push.remove(&from);
+            }
+            Some(token) if token.len() <= MAX_TOKEN => {
+                g.push.insert(from, token);
+            }
+            _ => {}
+        }
         g.presence.retain(|d, _| current.is_member(d));
+        g.push.retain(|d, _| current.is_member(d));
+        g.last_wake.retain(|d, _| current.is_member(d));
         let presence = g
             .presence
             .values()
@@ -211,6 +233,64 @@ impl State {
         Reply::Ok {
             log: stored,
             presence,
+        }
+    }
+
+    /// A member asks to wake another member of the same group.
+    async fn wake(
+        &self,
+        from: DeviceId,
+        req: WakeRequest,
+        now: u64,
+        hook: &wake::Hook,
+    ) -> WakeReply {
+        let skipped = |reason: &str| WakeReply::Skipped {
+            reason: reason.into(),
+        };
+        let Some(hook) = hook else {
+            return skipped("this server has no push gateway");
+        };
+        // Only groups the server already knows: a wake request never creates one.
+        let Some(group) = self.0.lock().expect("state lock").get(&req.group).cloned() else {
+            return WakeReply::Error {
+                message: "unknown group".into(),
+            };
+        };
+        let Some(stored) = group.lock().expect("group lock").log.clone() else {
+            return WakeReply::Error {
+                message: "unknown group".into(),
+            };
+        };
+        let Ok(Ok(membership)) = tokio::task::spawn_blocking(move || stored.verify()).await else {
+            return WakeReply::Error {
+                message: "internal error".into(),
+            };
+        };
+        if !membership.is_member(&from) || !membership.is_member(&req.device) {
+            return WakeReply::Error {
+                message: "both devices must be members of the group".into(),
+            };
+        }
+        let token = {
+            let mut g = group.lock().expect("group lock");
+            let Some(token) = g.push.get(&req.device).cloned() else {
+                return skipped("that device has no push token");
+            };
+            let last = g.last_wake.get(&req.device).copied().unwrap_or(0);
+            if now.saturating_sub(last) < WAKE_INTERVAL_SECS {
+                return skipped("woken moments ago");
+            }
+            g.last_wake.insert(req.device, now);
+            token
+        };
+        match hook.wake(&token, req.group).await {
+            Ok(()) => WakeReply::Sent,
+            Err(e) => {
+                tracing::warn!("push gateway failed: {e:#}");
+                WakeReply::Error {
+                    message: "the push gateway failed".into(),
+                }
+            }
         }
     }
 
@@ -253,6 +333,40 @@ impl ProtocolHandler for CoordProtocol {
     }
 }
 
+#[derive(Clone)]
+struct WakeProtocol {
+    state: State,
+    hook: wake::Hook,
+}
+
+impl std::fmt::Debug for WakeProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WakeProtocol")
+    }
+}
+
+impl ProtocolHandler for WakeProtocol {
+    async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
+        let from = connection.remote_id();
+        let Ok(opened) = tokio::time::timeout(READ_TIMEOUT, connection.accept_bi()).await else {
+            return Ok(());
+        };
+        let (mut send, mut recv) = opened?;
+        let reply = match read_frame::<WakeRequest>(&mut recv).await {
+            Ok(req) => self.state.wake(from, req, now_secs(), &self.hook).await,
+            Err(e) => WakeReply::Error {
+                message: e.to_string(),
+            },
+        };
+        write_frame(&mut send, &reply)
+            .await
+            .map_err(AcceptError::from_err)?;
+        send.finish()?;
+        let _ = tokio::time::timeout(READ_TIMEOUT, connection.closed()).await;
+        Ok(())
+    }
+}
+
 /// A running coordination server.
 pub struct Server {
     router: Router,
@@ -263,9 +377,18 @@ impl Server {
     /// Starts a server whose identity is `identity` (devices pin it), bound to `port`
     /// (0 for any).
     pub async fn spawn(identity: &Identity, port: u16) -> anyhow::Result<Self> {
+        Self::spawn_with(identity, port, None).await
+    }
+
+    /// Like [`Server::spawn`], with a hook that sends pushes to wake sleeping devices.
+    pub async fn spawn_with(
+        identity: &Identity,
+        port: u16,
+        hook: Option<Arc<dyn WakeHook>>,
+    ) -> anyhow::Result<Self> {
         let endpoint = Endpoint::builder(presets::Minimal)
             .secret_key(identity.secret_key().clone())
-            .alpns(vec![COORD_ALPN.to_vec()])
+            .alpns(vec![COORD_ALPN.to_vec(), WAKE_ALPN.to_vec()])
             .bind_addr(SocketAddr::from(([0, 0, 0, 0], port)))
             .map_err(|e| anyhow!("bad bind address: {e}"))?
             .bind()
@@ -277,6 +400,13 @@ impl Server {
                 COORD_ALPN,
                 CoordProtocol {
                     state: state.clone(),
+                },
+            )
+            .accept(
+                WAKE_ALPN,
+                WakeProtocol {
+                    state: state.clone(),
+                    hook,
                 },
             )
             .spawn();
@@ -348,6 +478,15 @@ pub struct SyncOutcome {
 /// Publishes this node's log and addresses, adopts the server's log if it is newer, and
 /// remembers where the other members are.
 pub async fn sync(node: &Node, server: EndpointAddr) -> anyhow::Result<SyncOutcome> {
+    sync_with(node, server, None).await
+}
+
+/// Like [`sync`], also publishing this device's push token (`Some("")` removes it).
+pub async fn sync_with(
+    node: &Node,
+    server: EndpointAddr,
+    push: Option<String>,
+) -> anyhow::Result<SyncOutcome> {
     let here = node.addr();
     let addrs: Vec<SocketAddr> = here.ip_addrs().copied().collect();
     let relay = here.relay_urls().next().map(ToString::to_string);
@@ -366,6 +505,7 @@ pub async fn sync(node: &Node, server: EndpointAddr) -> anyhow::Result<SyncOutco
             log: node.group().log(),
             addrs,
             relay,
+            push,
         },
     )
     .await?;
@@ -414,9 +554,20 @@ pub fn spawn_sync_loop(
     server: EndpointAddr,
     every: Duration,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_sync_loop_with(node, server, every, Arc::default())
+}
+
+/// Like [`spawn_sync_loop`], publishing whatever push token `push` holds at each sync.
+pub fn spawn_sync_loop_with(
+    node: Arc<Node>,
+    server: EndpointAddr,
+    every: Duration,
+    push: Arc<Mutex<Option<String>>>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if let Err(e) = sync(&node, server.clone()).await {
+            let token = push.lock().expect("push lock").clone();
+            if let Err(e) = sync_with(&node, server.clone(), token).await {
                 tracing::warn!("coordination sync failed: {e:#}");
             }
             tokio::time::sleep(every).await;

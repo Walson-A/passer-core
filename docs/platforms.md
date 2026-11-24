@@ -7,8 +7,8 @@ thin layer that talks to the operating system differs.
 | Platform | How the core is embedded | Key storage | Status |
 |---|---|---|---|
 | **Windows** | Rust, directly (Tauri desktop app, CLI) | DPAPI (`DpapiKeyStore`) | builds and tested in CI |
-| **macOS** | Rust, directly (Tauri desktop app, CLI); or Swift through `passer-ffi` | Keychain through `KeyVault` (planned for the Rust path) | builds and tested in CI |
-| **Linux** | Rust, directly (Tauri desktop app, CLI, headless daemon) | file (`FileKeyStore`); Secret Service planned | builds and tested in CI |
+| **macOS** | Rust, directly (Tauri desktop app, CLI); or Swift through `passer-ffi` | Keychain (`KeyringKeyStore`), or `KeyVault` from Swift | builds and tested in CI |
+| **Linux** | Rust, directly (Tauri desktop app, CLI, headless daemon) | Secret Service (`KeyringKeyStore`); an owner-only file without one (headless) | builds and tested in CI |
 | **iOS / iPadOS** | Swift bindings of `passer-ffi` (UniFFI), wrapped in an Expo module for the React Native app | Keychain `ThisDeviceOnly`, implemented by the app as `KeyVault` | library builds in CI for `aarch64-apple-ios` and the simulator |
 | **Android** | Kotlin bindings of `passer-ffi` (UniFFI), wrapped in an Expo module | Keystore-wrapped storage, implemented by the app as `KeyVault` | library builds in CI for `aarch64-linux-android` |
 

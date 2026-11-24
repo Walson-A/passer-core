@@ -24,7 +24,10 @@ The content devices exchange (files, clipboard, screen), the ability to act on a
 | | poison an MCP tool's description or effect | one MCP tool per distinct declaration; one device's declaration never describes another's | in place |
 | Manipulated AI agent | read data, send it elsewhere | agents denied by default; grants pinned to the relaying device; no capability in the core sends outside the group | in place |
 | Replay / downgrade | reuse a request or signature | context-separated signatures; one-time invitations; versioned ALPNs and links | in place |
-| Resource exhaustion | memory, CPU, tasks | frames ≤ 1 MiB read incrementally with a 15 s timeout; logs ≤ 4096 entries; server checks signatures off-lock on blocking threads, per-group locks, ≤ 100 000 groups | partial (no rate limiting of joins and publishes yet) |
+| | send a file outside the receiving folder, or overwrite one | `file.drop` keeps the base name only (no separators, `.`/`..`, reserved Windows names, control or bidi characters), never overwrites, writes complete files only; `file.get` serves only regular files directly in the shared folder, after resolving links | in place |
+| | make a device believe a cut transfer is complete | stream chunks end with an explicit marker; a stream that stops without it is broken, its partial file deleted | in place |
+| | wake someone else's phone, or every few seconds | wake requests only between members of the same group, verified against the signed log; at most one push per device every 15 s; the server never sees why | in place |
+| Resource exhaustion | memory, CPU, tasks | frames ≤ 1 MiB and stream chunks ≤ 256 KiB read incrementally, bounded buffers both ways (backpressure); a silent stream breaks after 60 s; uploads bounded per capability (4 GiB by default); logs ≤ 4096 entries; server checks signatures off-lock on blocking threads, per-group locks, ≤ 100 000 groups | partial (no rate limiting of joins and publishes yet) |
 | Supply chain | poisoned dependency | locked dependencies, `cargo-deny` policy, few dependencies in the trust core | config in repo |
 
 ## Principles
@@ -83,8 +86,10 @@ An independent review (separate from the author of the code) reported 12 finding
 
 - **Key storage.** On Windows the key is encrypted with DPAPI (`DpapiKeyStore`, current
   user, extra entropy): useless on another machine or account, but readable by malware
-  running as the same user. Elsewhere it is a plain file (`FileKeyStore`) unless the app
-  provides a `KeyVault` (Keychain `ThisDeviceOnly`, Android Keystore). TPM is not used yet.
+  running as the same user. On macOS it is in the Keychain, on Linux in the Secret Service
+  (`KeyringKeyStore`); a Linux machine without one (a headless server) keeps an owner-only
+  file. Phone apps provide a `KeyVault` (Keychain `ThisDeviceOnly`, Android Keystore). TPM
+  and the Secure Enclave are not used yet (see the next point).
 - **No hardware-bound root key.** The Secure Enclave and TPMs generally offer P-256, not
   Ed25519, while iroh's identity is Ed25519; the plan is a non-extractable P-256 root key
   that signs a rotatable Ed25519 transport key. Not designed in detail yet.
@@ -103,13 +108,20 @@ An independent review (separate from the author of the code) reported 12 finding
   apps should show a short id next to names.
 - **The journal** detects edits and deleted lines in the middle, not truncation of its tail
   or deletion of the whole file by someone with disk access.
-- **Approvals do not reach a sleeping phone** (needs push notifications).
-- **Streams are not implemented**; long-running modules must honour their lease themselves.
+- **Approvals on a sleeping phone** depend on the app: the core can wake it (push token,
+  wake request), but the app must show the prompt within the 60 s an approval waits.
+- **Push tokens** are stored by the coordination server and handed to its push gateway. A
+  compromised server could send pushes to those tokens (notifications without content, or
+  whatever the gateway lets it send); the gateway should only send silent wake-ups.
+- **A stream's lease bounds its life**, not its size: a long transfer needs a lease long
+  enough, and a module must stop when its lease ends (the bus also cuts the stream).
 - **Agent identity is asserted by the bridge device.** A grant pinned with `via` only trusts
   that device's claim. The hosted MCP service (OAuth, per-agent consent) is not part of this
   repository.
 - **The MCP bridge and `serve` use the same device key** when run side by side on one device:
   both work for outgoing calls, but incoming calls reach only one of them.
+- **A self-hosted relay** forwards encrypted packets and sees device ids, IP addresses and
+  traffic volumes. By default anyone may relay through it; restrict it in `relay.toml`.
 - **n0's public relays** (CLI default network mode) are for development only. In that mode
   the device's relay is published to n0's DNS: anyone who knows a device id can see when it
   is online and which relay it uses.

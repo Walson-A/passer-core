@@ -78,6 +78,13 @@ impl Progress {
             l.progress(self.done, self.total);
         }
     }
+
+    /// The last report, unless the last step already said it.
+    fn finish(&mut self) {
+        if self.done != self.reported || self.done == 0 {
+            self.report();
+        }
+    }
 }
 
 /// Target side of an upload: the caller's bytes into a private file, then the handler.
@@ -188,7 +195,7 @@ pub async fn send(
         }
         progress.add(n);
     }
-    progress.report();
+    progress.finish();
     Ok(progress.done)
 }
 
@@ -213,6 +220,6 @@ pub async fn fetch(
         }
     }
     file.flush().await.map_err(PasserError::storage)?;
-    progress.report();
+    progress.finish();
     Ok(true)
 }

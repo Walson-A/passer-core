@@ -114,7 +114,10 @@ mod tests {
         let old = FileKeyStore::new(&path).load_or_create().unwrap();
         let store = KeyringKeyStore::new(&path);
         assert_eq!(store.load_or_create().unwrap().id(), old.id());
-        assert!(!path.exists(), "the file is gone once the keyring holds the key");
+        assert!(
+            !path.exists(),
+            "the file is gone once the keyring holds the key"
+        );
         assert_eq!(store.load_or_create().unwrap().id(), old.id());
 
         // Clean up the test entry.
