@@ -190,10 +190,18 @@ impl MembershipView for Group {
 // ---------------------------------------------------------------------------------------
 
 /// How the endpoint reaches the outside world.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Network {
     /// Direct addresses only, no relay, no address lookup. Tests and local networks.
     LocalOnly,
+    /// A relay you run (`iroh-relay`, see docs/self-hosting.md), for devices that cannot
+    /// reach each other directly. Devices learn each other's addresses from invitations
+    /// and from a coordination server; nothing goes through n0.
+    Relay(iroh::RelayUrl),
+    /// Like `Relay`, without checking the relay's TLS certificate. Tests only.
+    #[cfg(feature = "insecure-test-relay")]
+    #[doc(hidden)]
+    InsecureTestRelay(iroh::RelayUrl),
     /// n0's public relays and address lookup. **Development only**: n0 reserves them for
     /// development and hobby use, without guarantees. Production uses Passer's own relays.
     N0Dev,
@@ -207,6 +215,13 @@ async fn bind(
     let builder = match network {
         Network::LocalOnly => Endpoint::builder(presets::Minimal),
         Network::N0Dev => Endpoint::builder(presets::N0),
+        Network::Relay(url) => {
+            Endpoint::builder(presets::Minimal).relay_mode(iroh::RelayMode::Custom(url.into()))
+        }
+        #[cfg(feature = "insecure-test-relay")]
+        Network::InsecureTestRelay(url) => Endpoint::builder(presets::Minimal)
+            .relay_mode(iroh::RelayMode::Custom(url.into()))
+            .ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify()),
     };
     let endpoint = builder
         .secret_key(identity.secret_key().clone())
@@ -700,9 +715,13 @@ impl Node {
         if !membership.is_approver(&self.id()) {
             bail!("only an approver device can invite");
         }
-        let addrs = self.addr().ip_addrs().map(ToString::to_string).collect();
+        let here = self.addr();
+        let addrs = here.ip_addrs().map(ToString::to_string).collect();
         let mut invitation =
             Invitation::new(membership.group, self.id(), ttl_secs, now_secs(), addrs);
+        if let Some(relay) = here.relay_urls().next() {
+            invitation = invitation.with_relay(relay.to_string());
+        }
         if approver {
             invitation = invitation.as_approver();
         }
@@ -890,6 +909,13 @@ pub async fn join(
         if let Ok(sock) = a.parse::<SocketAddr>() {
             addr = addr.with_ip_addr(sock);
         }
+    }
+    if let Some(url) = invitation
+        .relay
+        .as_deref()
+        .and_then(|u| u.parse::<iroh::RelayUrl>().ok())
+    {
+        addr = addr.with_relay_url(url);
     }
     let result = async {
         let conn = endpoint

@@ -7,6 +7,10 @@ license.workspace = true
 publish.workspace = true
 repository.workspace = true
 
+[features]
+# Lets tests use a local relay with a self-signed certificate. Never in a product.
+insecure-test-relay = ["iroh/test-utils"]
+
 [dependencies]
 async-trait = "0.1"
 passer-identity = { path = "../passer-identity" }

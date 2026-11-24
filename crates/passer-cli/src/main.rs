@@ -39,9 +39,13 @@ struct Cli {
     /// Where this device keeps its key, group and journal.
     #[arg(long, env = "PASSER_CORE_HOME", global = true)]
     home: Option<PathBuf>,
-    /// `local`: direct addresses only. `n0`: n0's public relays and lookup (development only).
+    /// `local`: direct addresses only. `relay`: your own relay (`--relay`), see
+    /// docs/self-hosting.md. `n0`: n0's public relays and lookup (development only).
     #[arg(long, value_enum, default_value_t = Net::N0, global = true)]
     network: Net,
+    /// Your relay's URL, for `--network relay` (e.g. `https://relay.example.com`).
+    #[arg(long, env = "PASSER_CORE_RELAY", global = true)]
+    relay: Option<String>,
     /// Coordination server, as `<id>@<ip:port>[,<ip:port>...]`: publishes this device's
     /// presence and log, and learns where the other members are.
     #[arg(long, env = "PASSER_CORE_COORD", global = true)]
@@ -53,16 +57,22 @@ struct Cli {
 #[derive(Clone, Copy, ValueEnum)]
 enum Net {
     Local,
+    Relay,
     N0,
 }
 
-impl From<Net> for Network {
-    fn from(n: Net) -> Self {
-        match n {
-            Net::Local => Network::LocalOnly,
-            Net::N0 => Network::N0Dev,
+fn network(net: Net, relay: Option<&str>) -> anyhow::Result<Network> {
+    Ok(match net {
+        Net::Local => Network::LocalOnly,
+        Net::N0 => Network::N0Dev,
+        Net::Relay => {
+            let url = relay.context("`--network relay` needs `--relay <url>`")?;
+            Network::Relay(
+                url.parse()
+                    .with_context(|| format!("bad relay URL {url}"))?,
+            )
         }
-    }
+    })
 }
 
 #[derive(Subcommand)]
@@ -220,7 +230,7 @@ impl Home {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let home = Home::resolve(cli.home)?;
-    let network: Network = cli.network.into();
+    let network: Network = network(cli.network, cli.relay.as_deref())?;
     let coord = cli
         .coord
         .as_deref()
@@ -317,7 +327,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             });
             let options = NodeOptions {
-                network,
+                network: network.clone(),
                 on_admitted: Some(hook),
                 approver: Some(approver),
             };

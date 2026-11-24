@@ -1,0 +1,19 @@
+# iroh-relay configuration for passer-core. Replace relay.example.com with your domain,
+# pointed at this machine (A/AAAA records), with ports 80, 443 and 7842/udp open.
+enable_relay = true
+http_bind_addr = "[::]:80"
+enable_quic_addr_discovery = true
+
+[tls]
+https_bind_addr = "[::]:443"
+cert_mode = "LetsEncrypt"
+hostname = ["relay.example.com"]
+contact = "admin@example.com"
+cert_dir = "/data/certs"
+# Let's Encrypt's staging server while you try things out; set to true once it works.
+prod_tls = false
+
+# By default anyone may relay through this server. Relayed traffic stays end-to-end
+# encrypted between devices, but you pay for the bandwidth. To restrict it to your own
+# devices, list their ids (shown by `passer-core status`):
+# access.allowlist = ["<device id>", "<device id>"]

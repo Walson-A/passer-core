@@ -43,6 +43,9 @@ const MAX_ADDRS: usize = 8;
 pub struct Presence {
     pub device: DeviceId,
     pub addrs: Vec<SocketAddr>,
+    /// The relay it is reachable through, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
     pub seen_at: u64,
 }
 
@@ -51,6 +54,8 @@ pub struct Presence {
 struct Publish {
     log: DeviceLog,
     addrs: Vec<SocketAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -184,11 +189,15 @@ impl State {
 
         let mut addrs = msg.addrs;
         addrs.truncate(MAX_ADDRS);
+        let relay = msg
+            .relay
+            .filter(|u| passer_membership::pairing::valid_relay(u));
         g.presence.insert(
             from,
             Presence {
                 device: from,
                 addrs,
+                relay,
                 seen_at: now,
             },
         );
@@ -306,11 +315,23 @@ impl Server {
 /// Parses a server address written as `<id>@<ip:port>[,<ip:port>...]` (or just `<id>`).
 pub fn parse_server(s: &str) -> anyhow::Result<EndpointAddr> {
     use anyhow::Context;
+    use std::net::ToSocketAddrs;
     let (id, addrs) = s.split_once('@').unwrap_or((s, ""));
     let id: DeviceId = id.parse().context("bad coordination server id")?;
     let mut addr = EndpointAddr::new(id);
     for a in addrs.split(',').filter(|a| !a.is_empty()) {
-        addr = addr.with_ip_addr(a.parse().with_context(|| format!("bad address {a}"))?);
+        // `ip:port`, or `host:port` resolved now (the server's key is what is trusted,
+        // not its name: a wrong address only fails to connect).
+        let resolved: Vec<SocketAddr> = match a.parse::<SocketAddr>() {
+            Ok(sock) => vec![sock],
+            Err(_) => a
+                .to_socket_addrs()
+                .with_context(|| format!("bad address {a}"))?
+                .collect(),
+        };
+        for sock in resolved {
+            addr = addr.with_ip_addr(sock);
+        }
     }
     Ok(addr)
 }
@@ -327,7 +348,9 @@ pub struct SyncOutcome {
 /// Publishes this node's log and addresses, adopts the server's log if it is newer, and
 /// remembers where the other members are.
 pub async fn sync(node: &Node, server: EndpointAddr) -> anyhow::Result<SyncOutcome> {
-    let addrs: Vec<SocketAddr> = node.addr().ip_addrs().copied().collect();
+    let here = node.addr();
+    let addrs: Vec<SocketAddr> = here.ip_addrs().copied().collect();
+    let relay = here.relay_urls().next().map(ToString::to_string);
     let conn = node
         .endpoint()
         .connect(server, COORD_ALPN)
@@ -342,6 +365,7 @@ pub async fn sync(node: &Node, server: EndpointAddr) -> anyhow::Result<SyncOutco
         &Publish {
             log: node.group().log(),
             addrs,
+            relay,
         },
     )
     .await?;
@@ -370,6 +394,9 @@ pub async fn sync(node: &Node, server: EndpointAddr) -> anyhow::Result<SyncOutco
                 for a in &p.addrs {
                     addr = addr.with_ip_addr(*a);
                 }
+                if let Some(url) = p.relay.as_deref().and_then(|u| u.parse().ok()) {
+                    addr = addr.with_relay_url(url);
+                }
                 node.peers().remember(addr);
             }
             Ok(SyncOutcome {
@@ -395,4 +422,25 @@ pub fn spawn_sync_loop(
             tokio::time::sleep(every).await;
         }
     })
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn servers_by_address_or_name() {
+        let id = Identity::generate().id();
+        let by_ip = parse_server(&format!("{id}@203.0.113.7:4433")).unwrap();
+        assert_eq!(by_ip.ip_addrs().count(), 1);
+        let by_name = parse_server(&format!("{id}@localhost:4433")).unwrap();
+        assert!(
+            by_name
+                .ip_addrs()
+                .all(|a| a.port() == 4433 && a.ip().is_loopback())
+        );
+        assert!(by_name.ip_addrs().count() >= 1);
+        assert!(parse_server(&format!("{id}@no-port")).is_err());
+        assert!(parse_server("not-an-id@1.2.3.4:1").is_err());
+    }
 }

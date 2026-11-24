@@ -78,20 +78,29 @@ impl PasserError {
 }
 
 /// How far the device reaches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum NetworkKind {
     /// Direct addresses only (same network, or addresses from a coordination server).
     LocalOnly,
+    /// Your own relay (`https://...`), for devices on different networks. Pair it with a
+    /// coordination server so devices find each other. See docs/self-hosting.md.
+    Relay { url: String },
     /// n0's public relays and lookup. Development only.
     N0Dev,
 }
 
-impl From<NetworkKind> for Network {
-    fn from(n: NetworkKind) -> Self {
-        match n {
+impl TryFrom<NetworkKind> for Network {
+    type Error = PasserError;
+
+    fn try_from(n: NetworkKind) -> Result<Self, PasserError> {
+        Ok(match n {
             NetworkKind::LocalOnly => Network::LocalOnly,
             NetworkKind::N0Dev => Network::N0Dev,
-        }
+            NetworkKind::Relay { url } => Network::Relay(
+                url.parse()
+                    .map_err(|e| PasserError::invalid(format!("relay URL: {e}")))?,
+            ),
+        })
     }
 }
 
@@ -682,10 +691,14 @@ impl PasserDevice {
             return Err(PasserError::AlreadyInGroup);
         }
         let invitation = Invitation::parse_link(&link).map_err(PasserError::invalid)?;
-        let (log, sas) =
-            passer_node::join(&self.identity, &invitation, &device_name, network.into())
-                .await
-                .map_err(PasserError::network)?;
+        let (log, sas) = passer_node::join(
+            &self.identity,
+            &invitation,
+            &device_name,
+            Network::try_from(network)?,
+        )
+        .await
+        .map_err(PasserError::network)?;
         let group = Group::new(log, Some(self.group_path())).map_err(PasserError::storage)?;
         Ok(JoinResult {
             group_name: group.membership().name,
@@ -921,7 +934,7 @@ impl PasserDevice {
         }
         let bus = Arc::new(builder.build().map_err(PasserError::invalid)?);
         let options = NodeOptions {
-            network: network.into(),
+            network: Network::try_from(network)?,
             on_admitted: self
                 .admissions
                 .lock()

@@ -1,0 +1,15 @@
+# iroh-relay: n0's relay server, the version passer-core's iroh speaks.
+FROM rust:1-bookworm AS build
+RUN cargo install iroh-relay@1.5.0 --features server --locked
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --home /data relay && mkdir -p /data && chown relay /data
+COPY --from=build /usr/local/cargo/bin/iroh-relay /usr/local/bin/iroh-relay
+USER relay
+VOLUME /data
+# 80: HTTP (Let's Encrypt challenge, captive portal), 443: relay over HTTPS,
+# 7842/udp: QUIC address discovery, which helps devices connect directly.
+EXPOSE 80 443 7842/udp
+CMD ["iroh-relay", "--config-path", "/config/relay.toml"]

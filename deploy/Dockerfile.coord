@@ -1,0 +1,14 @@
+# passer-coord: the coordination server (device logs and presence).
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p passer-coord --locked
+
+FROM debian:bookworm-slim
+RUN useradd --system --home /data passer && mkdir -p /data && chown passer /data
+COPY --from=build /src/target/release/passer-coord /usr/local/bin/passer-coord
+USER passer
+VOLUME /data
+EXPOSE 4433/udp
+# The server key lives in /data: keep the volume, or devices will not recognise the server.
+CMD ["passer-coord", "--home", "/data", "--port", "4433"]

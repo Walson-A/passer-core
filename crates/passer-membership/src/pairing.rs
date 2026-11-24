@@ -38,6 +38,8 @@ pub struct Invitation {
     pub expires_at: u64,
     /// Where the inviter can be reached directly (`ip:port`), for the local network.
     pub addrs: Vec<String>,
+    /// The relay the inviter uses (an `https://` URL), to reach it from anywhere.
+    pub relay: Option<String>,
     /// Whether the new device becomes an approver. Decided by the inviter: the joining
     /// device cannot change it.
     pub approver: bool,
@@ -80,8 +82,18 @@ impl Invitation {
             secret,
             expires_at: now + ttl_secs.min(MAX_TTL_SECS),
             addrs,
+            relay: None,
             approver: false,
         }
+    }
+
+    /// The relay the inviter can be reached through. Ignored if it is not a plausible URL.
+    pub fn with_relay(mut self, url: impl Into<String>) -> Self {
+        let url = url.into();
+        if valid_relay(&url) {
+            self.relay = Some(url);
+        }
+        self
     }
 
     /// The joining device will be an approver (for a second phone, a laptop...).
@@ -102,6 +114,11 @@ impl Invitation {
         if !self.addrs.is_empty() {
             link.push_str("&a=");
             link.push_str(&self.addrs.join(","));
+        }
+        if let Some(relay) = &self.relay {
+            // Hex keeps the link free of characters that need escaping.
+            link.push_str("&u=");
+            link.push_str(&hex::encode(relay));
         }
         if self.approver {
             link.push_str("&r=approver");
@@ -154,6 +171,12 @@ impl Invitation {
             secret: hex32("s")?,
             expires_at,
             addrs,
+            // An unreadable relay is dropped, not fatal: direct addresses may still work.
+            relay: params
+                .get("u")
+                .and_then(|u| hex::decode(u).ok())
+                .and_then(|b| String::from_utf8(b).ok())
+                .filter(|u| valid_relay(u)),
             approver: params.get("r") == Some(&"approver"),
         })
     }
@@ -164,6 +187,13 @@ impl Invitation {
             &join_bytes(&self.group, &self.inviter, device, name),
         )
     }
+}
+
+/// A relay URL worth trying: `https://` (or `http://` for tests), printable, bounded.
+pub fn valid_relay(url: &str) -> bool {
+    url.len() <= 256
+        && (url.starts_with("https://") || url.starts_with("http://"))
+        && url.chars().all(|c| c.is_ascii_graphic())
 }
 
 /// What a joining device sends to the inviter.

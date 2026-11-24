@@ -24,5 +24,8 @@ tracing = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
+# A real relay in tests (self-signed certificate).
+iroh = { workspace = true, features = ["test-utils"] }
+passer-node = { path = "../passer-node", features = ["insecure-test-relay"] }
 passer-bus = { path = "../passer-bus" }
 passer-device-info = { path = "../passer-device-info" }
