@@ -7,16 +7,22 @@
 //! The private key never leaves the device. Where it is kept is the job of a
 //! [`KeyStore`]:
 //! - [`DpapiKeyStore`] on Windows: encrypted with DPAPI, bound to the user account;
+//! - `KeyringKeyStore` on macOS (Keychain) and Linux (Secret Service), with a file
+//!   readable only by its owner where Linux has no Secret Service (headless servers);
 //! - [`FileKeyStore`] everywhere: plain file, for development and tests only.
 //!
-//! [`platform_store`] picks the right one. Keychain (`ThisDeviceOnly`) and Android
-//! Keystore come with the mobile bindings. See `docs/security.md` for why the transport
+//! [`platform_store`] picks the right one. On iOS and Android the app supplies the vault
+//! (Keychain `ThisDeviceOnly`, Android Keystore) through `passer-ffi`. See `docs/security.md` for why the transport
 //! key is Ed25519 and how a hardware-bound root key is meant to sign it.
 
 #[cfg(windows)]
 mod dpapi;
 #[cfg(windows)]
 pub use dpapi::DpapiKeyStore;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod keyring_store;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub use keyring_store::KeyringKeyStore;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -27,7 +33,11 @@ pub fn platform_store(path: impl Into<PathBuf>) -> Box<dyn KeyStore> {
     {
         Box::new(DpapiKeyStore::new(path))
     }
-    #[cfg(not(windows))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        Box::new(KeyringKeyStore::new(path))
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     {
         Box::new(FileKeyStore::new(path))
     }
@@ -163,17 +173,22 @@ impl KeyStore for FileKeyStore {
                 if let Some(parent) = self.path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                let file = KeyFile {
-                    v: 1,
-                    secret: hex::encode(identity.secret.to_bytes()),
-                };
-                let json = serde_json::to_vec(&file).expect("key file serializes");
-                write_new_file(&self.path, &json)?;
+                write_key_file(&self.path, &identity)?;
                 Ok(identity)
             }
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// Writes a key file (owner-only on Unix), never over an existing one.
+pub(crate) fn write_key_file(path: &Path, identity: &Identity) -> std::io::Result<()> {
+    let file = KeyFile {
+        v: 1,
+        secret: hex::encode(identity.secret.to_bytes()),
+    };
+    let json = serde_json::to_vec(&file).expect("key file serializes");
+    write_new_file(path, &json)
 }
 
 /// Creates the file exclusively, so two processes never overwrite each other's key.
