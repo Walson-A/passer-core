@@ -25,6 +25,10 @@ jobs:
         with:
           targets: aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Part of the cache key: some build scripts (blake3) don't rerun when
+          # IPHONEOS_DEPLOYMENT_TARGET changes, so a new target needs a new cache.
+          key: ios-${{ env.IPHONEOS_DEPLOYMENT_TARGET }}
       - name: Build the static libraries
         run: |
           for t in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
