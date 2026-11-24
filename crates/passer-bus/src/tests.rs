@@ -233,6 +233,7 @@ async fn indicator_is_required_shown_and_hidden() {
         target: Some("notepad.exe".into()),
         input: json!({}),
         agent: None,
+        stream: false,
     };
 
     let (bus, me) = setup(|b| b.policy(allow_screen.clone()));

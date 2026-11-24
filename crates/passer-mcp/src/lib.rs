@@ -171,6 +171,7 @@ impl Bridge {
             target,
             input: Value::Object(args),
             agent: Some(self.agent.clone()),
+            stream: false,
         };
         let addr = self.node.peers().addr_of(device);
         match tokio::time::timeout(CALL_TIMEOUT, self.node.call(addr, request)).await {

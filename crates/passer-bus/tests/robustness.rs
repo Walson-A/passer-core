@@ -89,7 +89,7 @@ proptest! {
         let me = Identity::generate().id();
         let runs = Arc::new(AtomicUsize::new(0));
         let bus = Bus::builder(Arc::new(One(me))).module(Arc::new(Counter(runs.clone()))).build().unwrap();
-        let req = Request { capability: capability.clone(), target, input, agent: agent.clone() };
+        let req = Request { capability: capability.clone(), target, input, agent: agent.clone(), stream: false };
         let response = runtime().block_on(bus.handle(Subject { device: me, agent }, req));
         if capability == "t.secret" {
             prop_assert_eq!(runs.load(Ordering::SeqCst), 0, "sensitive ran without approval");
@@ -105,7 +105,7 @@ proptest! {
     fn journal_fields_are_printable(capability in ".{0,120}", target in ".{0,300}") {
         let me = Identity::generate().id();
         let bus = Bus::builder(Arc::new(One(me))).build().unwrap();
-        let req = Request { capability, target: Some(target), input: Value::Null, agent: None };
+        let req = Request { capability, target: Some(target), input: Value::Null, agent: None, stream: false };
         runtime().block_on(bus.handle(Subject::device(me), req));
         let line = bus.journal().recent().remove(0).record;
         prop_assert!(!line.capability.chars().any(char::is_control));

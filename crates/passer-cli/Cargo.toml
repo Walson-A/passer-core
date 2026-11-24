@@ -19,6 +19,7 @@ passer-node = { path = "../passer-node" }
 passer-coord = { path = "../passer-coord" }
 passer-mcp = { path = "../passer-mcp" }
 passer-device-info = { path = "../passer-device-info" }
+passer-files = { path = "../passer-files" }
 iroh = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }

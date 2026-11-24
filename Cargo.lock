@@ -2614,6 +2614,7 @@ dependencies = [
  "passer-bus",
  "passer-coord",
  "passer-device-info",
+ "passer-files",
  "passer-identity",
  "passer-mcp",
  "passer-membership",
@@ -2673,6 +2674,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "passer-files"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "passer-bus",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "passer-identity"
 version = "0.1.0"
 dependencies = [
@@ -2722,6 +2734,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blake3",
  "iroh",
  "passer-bus",
  "passer-device-info",

@@ -6,6 +6,9 @@
 //! passer-core join '<link>' --name Laptop          # on the second device
 //! passer-core serve                                # on the second device, too
 //! passer-core call PC device.info                  # from either one
+//! passer-core serve --inbox ~/Inbox --share ~/Public  # receive files, share a folder
+//! passer-core send PC ./video.mp4                  # from another member
+//! passer-core get PC notes.pdf --to ./notes.pdf
 //! ```
 //!
 //! Development tool. The device key is kept with DPAPI on Windows and in a plain file
@@ -82,6 +85,32 @@ enum Command {
         /// invite others).
         #[arg(long, requires = "invite")]
         as_approver: bool,
+        /// Accept files from other members (`file.drop`) into this folder.
+        #[arg(long)]
+        inbox: Option<PathBuf>,
+        /// Let other members get files from this folder (`file.get`).
+        #[arg(long)]
+        share: Option<PathBuf>,
+    },
+    /// Sends a file to another member's inbox (`file.drop`).
+    Send {
+        device: String,
+        path: PathBuf,
+        /// Name to give it there (defaults to its own name).
+        #[arg(long = "as")]
+        name: Option<String>,
+        #[arg(long)]
+        addr: Vec<String>,
+    },
+    /// Gets a file from another member's shared folder (`file.get`).
+    Get {
+        device: String,
+        name: String,
+        /// Where to save it (defaults to the same name in the current folder).
+        #[arg(long)]
+        to: Option<PathBuf>,
+        #[arg(long)]
+        addr: Vec<String>,
     },
     /// Joins a group with a link printed by `serve --invite` on an approver.
     Join {
@@ -246,6 +275,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve {
             invite,
             as_approver,
+            inbox,
+            share,
         } => {
             let identity = Arc::new(identity);
             let group = Arc::new(
@@ -264,6 +295,16 @@ async fn main() -> anyhow::Result<()> {
                 Bus::builder(group.clone())
                     .module(Arc::new(DeviceInfo::new(name.clone())))
                     .module(Arc::new(ApprovalModule::new(group.clone(), prompter)))
+                    .module(Arc::new({
+                        let mut files = passer_files::Files::new();
+                        if let Some(dir) = &inbox {
+                            files = files.inbox(dir);
+                        }
+                        if let Some(dir) = &share {
+                            files = files.shared(dir);
+                        }
+                        files
+                    }))
                     .approver(approver.clone())
                     .policy(home.load_policy()?)
                     .journal(journal)
@@ -285,6 +326,12 @@ async fn main() -> anyhow::Result<()> {
                 node.endpoint().online().await;
             }
             println!("{name} is serving as {}", node.id());
+            if let Some(dir) = &inbox {
+                println!("  receiving files into {}", dir.display());
+            }
+            if let Some(dir) = &share {
+                println!("  sharing files from {}", dir.display());
+            }
             for a in node.addr().ip_addrs() {
                 println!("  direct address: {a}");
             }
@@ -346,6 +393,121 @@ async fn main() -> anyhow::Result<()> {
             match response? {
                 Response::Ok { output } => println!("{}", serde_json::to_string_pretty(&output)?),
                 Response::Error { code, message } => bail!("{}: {message}", code.as_str()),
+            }
+        }
+        Command::Send {
+            device,
+            path,
+            name,
+            addr,
+        } => {
+            let name = match name {
+                Some(n) => n,
+                None => path
+                    .file_name()
+                    .context("the path has no file name")?
+                    .to_string_lossy()
+                    .into_owned(),
+            };
+            let size = std::fs::metadata(&path)
+                .with_context(|| format!("cannot read {}", path.display()))?
+                .len();
+            let (node, peer) =
+                client(identity, &home, network, &device, &addr, coord.as_ref()).await?;
+            let opened = node
+                .open_stream(
+                    peer,
+                    Request::stream(passer_files::DROP, serde_json::json!({ "name": name })),
+                )
+                .await;
+            let response = async {
+                let open = match opened? {
+                    Ok(open) => open,
+                    Err(refusal) => return Ok(refusal),
+                };
+                let mut file = tokio::fs::File::open(&path).await?;
+                let mut buf = vec![0u8; 256 * 1024];
+                let mut sent = 0u64;
+                loop {
+                    let n = tokio::io::AsyncReadExt::read(&mut file, &mut buf).await?;
+                    if n == 0 || open.io.outgoing.send(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    sent += n as u64;
+                    eprint!("\r{} / {} MB", sent / 1_000_000, size / 1_000_000);
+                }
+                eprintln!();
+                drop(open.io);
+                open.done.await?
+            }
+            .await;
+            node.shutdown().await?;
+            match response? {
+                Response::Ok { output } => println!("{}", serde_json::to_string_pretty(&output)?),
+                Response::Error { code, message } => bail!("{}: {message}", code.as_str()),
+            }
+        }
+        Command::Get {
+            device,
+            name,
+            to,
+            addr,
+        } => {
+            let destination = to.unwrap_or_else(|| PathBuf::from(&name));
+            let mut part = destination.clone().into_os_string();
+            part.push(".part");
+            let part = PathBuf::from(part);
+            let (node, peer) =
+                client(identity, &home, network, &device, &addr, coord.as_ref()).await?;
+            let opened = node
+                .open_stream(
+                    peer,
+                    Request::stream(passer_files::GET, serde_json::json!({ "name": name })),
+                )
+                .await;
+            let response = async {
+                let mut open = match opened? {
+                    Ok(open) => open,
+                    Err(refusal) => return Ok((refusal, false)),
+                };
+                let mut file = tokio::fs::File::create(&part).await?;
+                let mut got = 0u64;
+                let complete = loop {
+                    match open.io.incoming.next().await {
+                        Ok(Some(bytes)) => {
+                            tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await?;
+                            got += bytes.len() as u64;
+                            eprint!("\r{} MB", got / 1_000_000);
+                        }
+                        Ok(None) => break true,
+                        Err(_) => break false,
+                    }
+                };
+                eprintln!();
+                tokio::io::AsyncWriteExt::flush(&mut file).await?;
+                drop(open.io);
+                anyhow::Ok((open.done.await??, complete))
+            }
+            .await;
+            node.shutdown().await?;
+            match response {
+                Ok((Response::Ok { output }, true)) => {
+                    std::fs::rename(&part, &destination)?;
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                    println!("Saved to {}", destination.display());
+                }
+                Ok((Response::Error { code, message }, _)) => {
+                    let _ = std::fs::remove_file(&part);
+                    bail!("{}: {message}", code.as_str())
+                }
+                Ok((Response::Ok { .. }, false)) => {
+                    let _ = std::fs::remove_file(&part);
+                    bail!("the transfer broke before the file was complete")
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(&part);
+                    return Err(e);
+                }
             }
         }
         Command::Sync { device, addr } => {

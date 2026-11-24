@@ -13,6 +13,10 @@ pub struct Request {
     /// Set by a bridge (MCP) when it relays an AI agent. Lowers privileges by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// The caller opens a stream, not a call. A capability only runs in the mode it
+    /// declares, so a call can never turn into a stream the caller did not expect.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream: bool,
 }
 
 impl Request {
@@ -22,6 +26,15 @@ impl Request {
             target: None,
             input,
             agent: None,
+            stream: false,
+        }
+    }
+
+    /// A request that opens a stream capability.
+    pub fn stream(capability: &str, input: Value) -> Self {
+        Self {
+            stream: true,
+            ..Self::new(capability, input)
         }
     }
 }
@@ -68,6 +81,18 @@ pub enum Response {
 }
 
 impl Response {
+    /// The first frame of an accepted stream: the target ran every check, the bytes can
+    /// flow. The stream's own result comes as a last frame once it ends.
+    pub fn stream_open() -> Self {
+        Response::Ok {
+            output: serde_json::json!({ "stream": "open" }),
+        }
+    }
+
+    pub fn is_stream_open(&self) -> bool {
+        matches!(self, Response::Ok { output } if output.get("stream").and_then(Value::as_str) == Some("open"))
+    }
+
     pub fn error(code: ErrorCode, message: impl Into<String>) -> Self {
         Response::Error {
             code,

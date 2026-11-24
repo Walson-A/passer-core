@@ -25,13 +25,14 @@ use anyhow::{Context, anyhow, bail};
 use iroh::endpoint::{Connection, presets};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr};
-use passer_bus::{Bus, MembershipView, Request, Response, Subject};
+use passer_bus::stream::{self, Chunk, StreamIo};
+use passer_bus::{Bus, MembershipView, Mode, Request, Response, Subject};
 use passer_identity::{DeviceId, Identity};
 use passer_membership::pairing::{Invitation, InvitationBook, JoinRequest};
 use passer_membership::{DeviceLog, Membership, Op, Preferred};
 use serde::{Deserialize, Serialize};
 
-use crate::frame::{read_frame, write_frame};
+use crate::frame::{STREAM_IDLE, read_chunk, read_frame, write_chunk, write_end, write_frame};
 
 pub const BUS_ALPN: &[u8] = b"passer-core/bus/1";
 pub const LOG_ALPN: &[u8] = b"passer-core/log/1";
@@ -289,22 +290,102 @@ impl ProtocolHandler for BusProtocol {
             };
             let bus = self.bus.clone();
             tokio::spawn(async move {
-                let response = match read_frame::<Request>(&mut recv).await {
-                    Ok(request) => {
-                        let subject = Subject {
-                            device: remote,
-                            agent: request.agent.clone(),
-                        };
-                        bus.handle(subject, request).await
+                let request = match read_frame::<Request>(&mut recv).await {
+                    Ok(request) => request,
+                    Err(e) => {
+                        let response =
+                            Response::error(passer_bus::ErrorCode::Protocol, e.to_string());
+                        if write_frame(&mut send, &response).await.is_ok() {
+                            let _ = send.finish();
+                        }
+                        return;
                     }
-                    Err(e) => Response::error(passer_bus::ErrorCode::Protocol, e.to_string()),
                 };
+                let subject = Subject {
+                    device: remote,
+                    agent: request.agent.clone(),
+                };
+                if request.stream {
+                    serve_stream(&bus, subject, request, send, recv).await;
+                    return;
+                }
+                let response = bus.handle(subject, request).await;
                 if write_frame(&mut send, &response).await.is_ok() {
                     let _ = send.finish();
                 }
             });
         }
     }
+}
+
+/// Target side of a stream: the bus checks, then bytes flow both ways until the module
+/// is done, then the module's result closes the stream.
+async fn serve_stream(
+    bus: &Bus,
+    subject: Subject,
+    request: Request,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+) {
+    let session = match bus.open(subject, request, Mode::Stream).await {
+        Ok(session) => session,
+        Err(refusal) => {
+            if write_frame(&mut send, &refusal).await.is_ok() {
+                let _ = send.finish();
+            }
+            return;
+        }
+    };
+    let (io, peer) = stream::pair();
+    let opened = write_frame(&mut send, &Response::stream_open())
+        .await
+        .is_ok();
+    let stream::StreamPeer {
+        to_module,
+        mut from_module,
+    } = peer;
+    // Network to module. Without the end marker, the module sees a broken stream.
+    let reader = tokio::spawn(async move {
+        if !opened {
+            return;
+        }
+        loop {
+            match read_chunk(&mut recv, STREAM_IDLE).await {
+                Ok(Some(bytes)) => {
+                    if to_module.send(Chunk::Data(bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    let _ = to_module.send(Chunk::End).await;
+                    return;
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    // Module to network, while the module runs.
+    let writer = async move {
+        let mut ok = opened;
+        while let Some(bytes) = from_module.recv().await {
+            if ok && write_chunk(&mut send, &bytes).await.is_err() {
+                ok = false;
+            }
+        }
+        (send, ok)
+    };
+    let (response, (mut send, ok)) = tokio::join!(session.run_stream(io), writer);
+    reader.abort();
+    if ok && write_end(&mut send).await.is_ok() && write_frame(&mut send, &response).await.is_ok() {
+        let _ = send.finish();
+    }
+}
+
+/// The caller's side of an open stream: send and receive through `io`, then await
+/// `done` for the target's result.
+pub struct OpenStream {
+    pub io: StreamIo,
+    pub done: tokio::task::JoinHandle<anyhow::Result<Response>>,
 }
 
 #[derive(Clone)]
@@ -644,6 +725,83 @@ impl Node {
         }
         self.peers.remember(peer.clone());
         call_peer(self.endpoint(), self.peers.addr_of(&peer.id), request).await
+    }
+
+    /// Opens a stream capability on another member. `Err(response)` inside is the
+    /// target's refusal (not a member, denied, approval timeout...).
+    pub async fn open_stream(
+        &self,
+        peer: impl Into<EndpointAddr>,
+        request: Request,
+    ) -> anyhow::Result<Result<OpenStream, Response>> {
+        let peer = peer.into();
+        if !self.group.is_member(&peer.id) {
+            bail!("{} is not a member of this group", peer.id.fmt_short());
+        }
+        self.peers.remember(peer.clone());
+        let conn = self
+            .endpoint()
+            .connect(self.peers.addr_of(&peer.id), BUS_ALPN)
+            .await
+            .map_err(|e| anyhow!("connecting: {e}"))?;
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| anyhow!("opening a stream: {e}"))?;
+        let request = Request {
+            stream: true,
+            ..request
+        };
+        write_frame(&mut send, &request).await?;
+        // The target may be waiting for its user's approval: allow for it.
+        let first: Response = frame::read_frame_within(&mut recv, frame::ANSWER_TIMEOUT).await?;
+        if !first.is_stream_open() {
+            conn.close(0u32.into(), b"refused");
+            return Ok(Err(first));
+        }
+        let (io, peer) = stream::pair();
+        let stream::StreamPeer {
+            to_module,
+            mut from_module,
+        } = peer;
+        // What this side sends: chunks until `io.outgoing` is dropped, then the end marker.
+        let sender = tokio::spawn(async move {
+            while let Some(bytes) = from_module.recv().await {
+                write_chunk(&mut send, &bytes).await?;
+            }
+            write_end(&mut send).await?;
+            let _ = send.finish();
+            anyhow::Ok(())
+        });
+        let done = tokio::spawn(async move {
+            loop {
+                // While this side uploads, the target may stay silent until it is done:
+                // QUIC notices a vanished peer, and the target's lease bounds the stream.
+                match read_chunk(&mut recv, frame::STREAM_ANSWER_IDLE).await {
+                    Ok(Some(bytes)) => {
+                        // The caller may have stopped reading; keep draining to the result.
+                        let _ = to_module.send(Chunk::Data(bytes)).await;
+                    }
+                    Ok(None) => {
+                        let _ = to_module.send(Chunk::End).await;
+                        break;
+                    }
+                    Err(e) => {
+                        sender.abort();
+                        conn.close(0u32.into(), b"broken");
+                        return Err(anyhow!("the stream broke: {e}"));
+                    }
+                }
+            }
+            drop(to_module);
+            let result: Response =
+                frame::read_frame_within(&mut recv, frame::ANSWER_TIMEOUT).await?;
+            // The target has answered: whatever this side still meant to send is moot.
+            sender.abort();
+            conn.close(0u32.into(), b"done");
+            Ok(result)
+        });
+        Ok(Ok(OpenStream { io, done }))
     }
 
     /// Fetches the device log from a peer and adopts it if it is a valid extension.

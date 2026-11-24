@@ -15,6 +15,7 @@
 //!   file...), for the [`CapabilitySpec`]s it declares. The bus checks permissions, asks for
 //!   approval, enforces sessions and journals *before* the handler is called.
 
+mod files;
 mod members;
 
 use std::path::PathBuf;
@@ -22,10 +23,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+pub use files::StreamKind;
 use members::MemberCache;
 use passer_bus::{
-    Bus, Capability, Ctx, Effect, Event, IndicatorRequirement, Journal, Manifest, Module,
-    ModuleError, Policy, Request, Response,
+    Bus, Capability, Ctx, Effect, Event, IndicatorRequirement, Journal, Manifest, Mode, Module,
+    ModuleError, Policy, Request, Response, StreamIo,
 };
 use passer_identity::{DeviceId, Identity, IdentityError, KeyStore};
 use passer_membership::DeviceLog;
@@ -124,6 +126,12 @@ pub struct CapabilitySpec {
     pub target_kind: Option<String>,
     /// The device must show a visible indicator while it runs.
     pub indicator_required: bool,
+    /// Set for a capability that moves a file: the caller sends one (`Upload`, see
+    /// [`CapabilityHandler::receive_file`]) or gets one (`Download`, see
+    /// [`CapabilityHandler::provide_file`]). `None`: a call with a JSON answer.
+    pub stream: Option<StreamKind>,
+    /// Largest upload accepted, in bytes (default 4 GiB).
+    pub max_bytes: Option<u64>,
 }
 
 /// What sort of device a member is. The app tells the core for its own device
@@ -293,6 +301,35 @@ pub trait CapabilityHandler: Send + Sync {
         input_json: String,
         caller: CallerInfo,
     ) -> Result<String, PasserError>;
+
+    /// An `Upload` capability received a whole file, at `path` in this device's private
+    /// folder. Move or copy it where it belongs before returning: whatever is left at
+    /// `path` is deleted. Returns the output as a JSON string. Incomplete files never
+    /// reach this method.
+    async fn receive_file(
+        &self,
+        capability: String,
+        target: Option<String>,
+        input_json: String,
+        caller: CallerInfo,
+        path: String,
+    ) -> Result<String, PasserError>;
+
+    /// A `Download` capability: returns the path of the file to send.
+    async fn provide_file(
+        &self,
+        capability: String,
+        target: Option<String>,
+        input_json: String,
+        caller: CallerInfo,
+    ) -> Result<String, PasserError>;
+}
+
+/// Told how far a file transfer has gone: `done` bytes so far, out of `total` when
+/// known (uploads). Called at most once per MiB, and once at the end.
+#[uniffi::export(with_foreign)]
+pub trait TransferProgress: Send + Sync {
+    fn progress(&self, done: u64, total: Option<u64>);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -320,6 +357,18 @@ struct ForeignModule {
     specs: Vec<CapabilitySpec>,
     handler: Arc<dyn CapabilityHandler>,
     group: Arc<Group>,
+    /// Where uploads land before the handler takes them.
+    incoming: PathBuf,
+}
+
+impl ForeignModule {
+    fn caller(&self, ctx: &Ctx) -> CallerInfo {
+        CallerInfo {
+            device_id: ctx.subject.device.to_string(),
+            device_name: name_of(&self.group, &ctx.subject.device),
+            agent: ctx.subject.agent.clone(),
+        }
+    }
 }
 
 #[async_trait]
@@ -340,6 +389,9 @@ impl Module for ForeignModule {
                 if s.indicator_required {
                     cap.indicator = IndicatorRequirement::Required;
                 }
+                if s.stream.is_some() {
+                    cap.mode = Mode::Stream;
+                }
                 cap
             })
             .collect();
@@ -350,12 +402,46 @@ impl Module for ForeignModule {
         }
     }
 
+    async fn invoke_stream(
+        &self,
+        ctx: Ctx,
+        capability: &str,
+        input: Value,
+        io: StreamIo,
+    ) -> Result<Value, ModuleError> {
+        let spec = self
+            .specs
+            .iter()
+            .find(|s| s.name == capability)
+            .ok_or_else(|| ModuleError::Unsupported(capability.to_owned()))?;
+        let call = (
+            capability.to_owned(),
+            ctx.target.clone(),
+            input.to_string(),
+            self.caller(&ctx),
+        );
+        match spec.stream {
+            Some(StreamKind::Upload) => {
+                let max = spec.max_bytes.unwrap_or(files::DEFAULT_MAX_BYTES);
+                let out = files::receive(io, &self.incoming, max, &self.handler, call)
+                    .await
+                    .map_err(ModuleError::Failed)?;
+                serde_json::from_str(&out).map_err(|e| {
+                    ModuleError::Failed(format!("the handler returned invalid JSON: {e}"))
+                })
+            }
+            Some(StreamKind::Download) => {
+                let bytes = files::provide(io, &self.handler, call)
+                    .await
+                    .map_err(ModuleError::Failed)?;
+                Ok(serde_json::json!({ "bytes": bytes }))
+            }
+            None => Err(ModuleError::Unsupported(capability.to_owned())),
+        }
+    }
+
     async fn invoke(&self, ctx: Ctx, capability: &str, input: Value) -> Result<Value, ModuleError> {
-        let caller = CallerInfo {
-            device_id: ctx.subject.device.to_string(),
-            device_name: name_of(&self.group, &ctx.subject.device),
-            agent: ctx.subject.agent.clone(),
-        };
+        let caller = self.caller(&ctx);
         let out = self
             .handler
             .invoke(
@@ -401,6 +487,25 @@ fn name_of(group: &Group, device: &DeviceId) -> String {
         .unwrap_or_default()
 }
 
+fn parse_input(input_json: &str) -> Result<Value, PasserError> {
+    if input_json.trim().is_empty() {
+        Ok(Value::Object(Default::default()))
+    } else {
+        serde_json::from_str(input_json).map_err(PasserError::invalid)
+    }
+}
+
+/// The target's answer, as the app sees it.
+fn answer(response: Response) -> Result<String, PasserError> {
+    match response {
+        Response::Ok { output } => Ok(output.to_string()),
+        Response::Error { code, message } => Err(PasserError::Refused {
+            code: code.as_str().into(),
+            message,
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // The device
 // ---------------------------------------------------------------------------------------
@@ -444,6 +549,32 @@ impl PasserDevice {
 
     fn journal_path(&self) -> PathBuf {
         self.home.join("journal.jsonl")
+    }
+
+    /// One line for each call or transfer this device makes, like the ones it receives.
+    fn journal_outgoing(
+        &self,
+        node: &Node,
+        to: &DeviceId,
+        capability: &str,
+        result: &Result<Response, PasserError>,
+    ) {
+        let outcome = match result {
+            Ok(Response::Ok { .. }) => "ok".to_owned(),
+            Ok(Response::Error { code, .. }) => code.as_str().to_owned(),
+            Err(PasserError::Network { .. }) => "unreachable".to_owned(),
+            Err(_) => "failed".to_owned(),
+        };
+        if let Err(e) = node.bus().journal().append(Event {
+            device: self.identity.id().to_string(),
+            to: Some(to.to_string()),
+            capability: passer_bus::printable(capability, 96),
+            decision: "none".into(),
+            outcome,
+            ..Default::default()
+        }) {
+            tracing::error!("journal write failed: {e}");
+        }
     }
 
     /// For desktop apps written in Rust: the key is kept by the platform's store
@@ -785,6 +916,7 @@ impl PasserDevice {
                 specs: specs.clone(),
                 handler: handler.clone(),
                 group: group.clone(),
+                incoming: self.home.join("incoming"),
             }));
         }
         let bus = Arc::new(builder.build().map_err(PasserError::invalid)?);
@@ -893,36 +1025,114 @@ impl PasserDevice {
     ) -> Result<String, PasserError> {
         let node = self.node().await?;
         let id = self.resolve(node.group(), &device)?;
-        let input: Value = if input_json.trim().is_empty() {
-            Value::Object(Default::default())
-        } else {
-            serde_json::from_str(&input_json).map_err(PasserError::invalid)?
-        };
+        let input = parse_input(&input_json)?;
         let addr = node.peers().addr_of(&id);
-        let result = node.call(addr, Request::new(&capability, input)).await;
-        // One line for each call this device makes, like the ones it receives.
-        let outcome = match &result {
-            Ok(Response::Ok { .. }) => "ok".to_owned(),
-            Ok(Response::Error { code, .. }) => code.as_str().to_owned(),
-            Err(_) => "unreachable".to_owned(),
+        let result = node
+            .call(addr, Request::new(&capability, input))
+            .await
+            .map_err(PasserError::network);
+        self.journal_outgoing(&node, &id, &capability, &result);
+        answer(result?)
+    }
+
+    /// Sends the file at `path` to an `Upload` capability of another member (by name or
+    /// id). Returns the target's output as JSON. The target only hands the file to its
+    /// app once all of it arrived.
+    pub async fn send_file(
+        &self,
+        device: String,
+        capability: String,
+        input_json: String,
+        path: String,
+        progress: Option<Arc<dyn TransferProgress>>,
+    ) -> Result<String, PasserError> {
+        let node = self.node().await?;
+        let id = self.resolve(node.group(), &device)?;
+        let input = parse_input(&input_json)?;
+        let opened = node
+            .open_stream(
+                node.peers().addr_of(&id),
+                Request::stream(&capability, input),
+            )
+            .await;
+        let result = match opened {
+            Err(e) => Err(PasserError::network(e)),
+            Ok(Err(refusal)) => Ok(refusal),
+            Ok(Ok(open)) => {
+                let passer_node::OpenStream { io, done } = open;
+                let StreamIo { incoming, outgoing } = io;
+                let sent = files::send(outgoing, std::path::Path::new(&path), progress).await;
+                drop(incoming);
+                match sent {
+                    Err(e) => {
+                        done.abort();
+                        Err(e)
+                    }
+                    Ok(_) => match done.await {
+                        Ok(Ok(response)) => Ok(response),
+                        Ok(Err(e)) => Err(PasserError::network(e)),
+                        Err(e) => Err(PasserError::network(e)),
+                    },
+                }
+            }
         };
-        if let Err(e) = node.bus().journal().append(Event {
-            device: self.identity.id().to_string(),
-            to: Some(id.to_string()),
-            capability: passer_bus::printable(&capability, 96),
-            decision: "none".into(),
-            outcome,
-            ..Default::default()
-        }) {
-            tracing::error!("journal write failed: {e}");
+        self.journal_outgoing(&node, &id, &capability, &result);
+        answer(result?)
+    }
+
+    /// Gets a file from a `Download` capability of another member (by name or id) into
+    /// `destination`, which appears only once the whole file arrived. Returns the
+    /// target's output as JSON (`{"bytes": n}`).
+    pub async fn fetch_file(
+        &self,
+        device: String,
+        capability: String,
+        input_json: String,
+        destination: String,
+        progress: Option<Arc<dyn TransferProgress>>,
+    ) -> Result<String, PasserError> {
+        let node = self.node().await?;
+        let id = self.resolve(node.group(), &device)?;
+        let input = parse_input(&input_json)?;
+        let destination = PathBuf::from(destination);
+        let mut part = destination.clone().into_os_string();
+        part.push(".part");
+        let part = PathBuf::from(part);
+        let opened = node
+            .open_stream(
+                node.peers().addr_of(&id),
+                Request::stream(&capability, input),
+            )
+            .await;
+        let result = match opened {
+            Err(e) => Err(PasserError::network(e)),
+            Ok(Err(refusal)) => Ok(refusal),
+            Ok(Ok(open)) => {
+                let passer_node::OpenStream { io, done } = open;
+                let StreamIo { incoming, outgoing } = io;
+                drop(outgoing);
+                let complete = files::fetch(incoming, &part, progress).await;
+                let response = done.await;
+                match (complete, response) {
+                    (Ok(true), Ok(Ok(response @ Response::Ok { .. }))) => {
+                        std::fs::rename(&part, &destination).map_err(PasserError::storage)?;
+                        Ok(response)
+                    }
+                    (Err(e), _) => Err(e),
+                    (_, Ok(Ok(response @ Response::Error { .. }))) => Ok(response),
+                    (_, Ok(Err(e))) => Err(PasserError::network(e)),
+                    (_, Err(e)) => Err(PasserError::network(e)),
+                    (Ok(_), Ok(Ok(_))) => Err(PasserError::Network {
+                        message: "the stream broke before the file was complete".into(),
+                    }),
+                }
+            }
+        };
+        if !matches!(result, Ok(Response::Ok { .. })) {
+            let _ = std::fs::remove_file(&part);
         }
-        match result.map_err(PasserError::network)? {
-            Response::Ok { output } => Ok(output.to_string()),
-            Response::Error { code, message } => Err(PasserError::Refused {
-                code: code.as_str().into(),
-                message,
-            }),
-        }
+        self.journal_outgoing(&node, &id, &capability, &result);
+        answer(result?)
     }
 
     /// Exchanges logs and addresses with the coordination server now.

@@ -51,6 +51,27 @@ impl CapabilityHandler for Clipboard {
         self.0.lock().unwrap().push(caller);
         Ok(r#"{"text":"hello from the PC"}"#.into())
     }
+
+    async fn receive_file(
+        &self,
+        _: String,
+        _: Option<String>,
+        _: String,
+        _: CallerInfo,
+        _: String,
+    ) -> Result<String, PasserError> {
+        unreachable!("no upload capability here")
+    }
+
+    async fn provide_file(
+        &self,
+        _: String,
+        _: Option<String>,
+        _: String,
+        _: CallerInfo,
+    ) -> Result<String, PasserError> {
+        unreachable!("no download capability here")
+    }
 }
 
 fn clipboard_spec() -> CapabilitySpec {
@@ -62,6 +83,8 @@ fn clipboard_spec() -> CapabilitySpec {
         effect: EffectKind::Sensitive,
         target_kind: None,
         indicator_required: false,
+        stream: None,
+        max_bytes: None,
     }
 }
 
@@ -316,4 +339,179 @@ async fn members_describe_themselves_and_both_sides_keep_a_journal() {
     );
     assert!(!again.journal_recent(5, None).await.unwrap().is_empty());
     pc.stop().await;
+}
+
+/// Stands in for the app's file code: keeps what it receives, serves one file.
+struct Drop {
+    kept: std::path::PathBuf,
+    served: std::path::PathBuf,
+}
+
+#[async_trait]
+impl CapabilityHandler for Drop {
+    async fn invoke(
+        &self,
+        _: String,
+        _: Option<String>,
+        _: String,
+        _: CallerInfo,
+    ) -> Result<String, PasserError> {
+        unreachable!()
+    }
+
+    async fn receive_file(
+        &self,
+        capability: String,
+        _: Option<String>,
+        input_json: String,
+        caller: CallerInfo,
+        path: String,
+    ) -> Result<String, PasserError> {
+        assert_eq!(capability, "file.put");
+        assert_eq!(caller.device_name, "iPhone");
+        let name: serde_json::Value = serde_json::from_str(&input_json).unwrap();
+        assert_eq!(name["name"], "video.mp4");
+        std::fs::rename(&path, &self.kept).unwrap();
+        Ok(r#"{"saved":true}"#.into())
+    }
+
+    async fn provide_file(
+        &self,
+        capability: String,
+        _: Option<String>,
+        _: String,
+        _: CallerInfo,
+    ) -> Result<String, PasserError> {
+        assert_eq!(capability, "file.get");
+        Ok(self.served.to_string_lossy().into_owned())
+    }
+}
+
+#[derive(Default)]
+struct Seen(Mutex<Vec<(u64, Option<u64>)>>);
+
+impl passer_ffi::TransferProgress for Seen {
+    fn progress(&self, done: u64, total: Option<u64>) {
+        self.0.lock().unwrap().push((done, total));
+    }
+}
+
+fn file_spec(name: &str, kind: passer_ffi::StreamKind, max: Option<u64>) -> CapabilitySpec {
+    CapabilitySpec {
+        name: name.into(),
+        title: name.into(),
+        description: name.into(),
+        input_schema_json: r#"{"type":"object"}"#.into(),
+        effect: EffectKind::Write,
+        target_kind: None,
+        indicator_required: false,
+        stream: Some(kind),
+        max_bytes: max,
+    }
+}
+
+#[tokio::test]
+async fn files_go_both_ways_whole_or_not_at_all() {
+    use passer_ffi::StreamKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data: Vec<u8> = (0..6 * 1024 * 1024 + 5).map(|i| (i % 253) as u8).collect();
+    let source = dir.path().join("source.bin");
+    std::fs::write(&source, &data).unwrap();
+
+    let pc = device(&dir, "pc", Arc::default());
+    pc.create_group("Walson".into(), "PC".into()).unwrap();
+    let kept = dir.path().join("kept.mp4");
+    pc.add_capabilities(
+        vec![
+            file_spec("file.put", StreamKind::Upload, None),
+            file_spec("file.small", StreamKind::Upload, Some(1024)),
+            file_spec("file.get", StreamKind::Download, None),
+        ],
+        Arc::new(Drop {
+            kept: kept.clone(),
+            served: source.clone(),
+        }),
+    );
+    pc.start(NetworkKind::LocalOnly, None).await.unwrap();
+    let invite = pc.invite(5, false).await.unwrap();
+    let phone = device(&dir, "phone", Arc::default());
+    phone
+        .join(invite.link, "iPhone".into(), NetworkKind::LocalOnly)
+        .await
+        .unwrap();
+    phone.start(NetworkKind::LocalOnly, None).await.unwrap();
+    phone
+        .add_peer_address("PC".into(), pc.addresses().await.unwrap().remove(0))
+        .await
+        .unwrap();
+
+    // Phone to PC, with progress.
+    let seen = Arc::new(Seen::default());
+    let out = phone
+        .send_file(
+            "PC".into(),
+            "file.put".into(),
+            r#"{"name":"video.mp4"}"#.into(),
+            source.to_string_lossy().into(),
+            Some(seen.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, r#"{"saved":true}"#);
+    assert_eq!(std::fs::read(&kept).unwrap(), data);
+    let seen = seen.0.lock().unwrap().clone();
+    assert!(seen.len() >= 6, "progress along the way: {seen:?}");
+    assert_eq!(
+        *seen.last().unwrap(),
+        (data.len() as u64, Some(data.len() as u64))
+    );
+
+    // Too large for the capability: refused, and nothing is left on the PC.
+    match phone
+        .send_file(
+            "PC".into(),
+            "file.small".into(),
+            "{}".into(),
+            source.to_string_lossy().into(),
+            None,
+        )
+        .await
+    {
+        Err(PasserError::Refused { code, .. }) => assert_eq!(code, "module_error"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    let incoming = dir.path().join("pc").join("incoming");
+    assert_eq!(std::fs::read_dir(&incoming).unwrap().count(), 0);
+
+    // PC to phone.
+    let destination = dir.path().join("fetched.bin");
+    let out = phone
+        .fetch_file(
+            "PC".into(),
+            "file.get".into(),
+            "{}".into(),
+            destination.to_string_lossy().into(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(out.contains(&format!("\"bytes\":{}", data.len())), "{out}");
+    assert_eq!(std::fs::read(&destination).unwrap(), data);
+
+    // Both transfers show in the phone's journal.
+    let lines = phone.journal_recent(10, Some("PC".into())).await.unwrap();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.capability == "file.get" && l.outgoing && l.outcome == "ok")
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.capability == "file.small" && l.outcome != "ok")
+    );
+
+    pc.stop().await;
+    phone.stop().await;
 }

@@ -12,11 +12,16 @@
 //!    and the indicator is shown for as long as the lease lives;
 //! 5. the invocation runs inside a [`LeaseHandle`], which the device can suspend or revoke;
 //! 6. one line goes to the [`Journal`], without any content.
+//!
+//! A `call` capability answers once ([`Bus::handle`]). A `stream` capability goes through
+//! the same checks ([`Bus::open`]), then exchanges bytes both ways for as long as its
+//! lease lives ([`Session::run_stream`], [`stream`]).
 
 pub mod capability;
 pub mod journal;
 pub mod lease;
 pub mod policy;
+pub mod stream;
 pub mod wire;
 
 use std::collections::HashMap;
@@ -31,6 +36,7 @@ pub use capability::{Capability, Effect, IndicatorRequirement, Manifest, Mode};
 pub use journal::{Event, Journal};
 pub use lease::{EndReason, LeaseHandle, LeaseInfo, LeaseState, Leases};
 pub use policy::{Decision, Policy, Rule, Subject, Verdict, Who};
+pub use stream::{StreamBroken, StreamClosed, StreamIo};
 pub use wire::{ErrorCode, Request, Response};
 
 /// Name of the built-in capability that lists what the requester may call.
@@ -117,6 +123,21 @@ pub enum ModuleError {
 pub trait Module: Send + Sync {
     fn manifest(&self) -> Manifest;
     async fn invoke(&self, ctx: Ctx, capability: &str, input: Value) -> Result<Value, ModuleError>;
+
+    /// Runs a `stream` capability: read what the caller sends from `io.incoming`, send
+    /// back through `io.outgoing`, and return a small JSON result once done. Stop when
+    /// `ctx.lease` ends; the bus also cuts the stream then.
+    async fn invoke_stream(
+        &self,
+        _ctx: Ctx,
+        capability: &str,
+        _input: Value,
+        _io: StreamIo,
+    ) -> Result<Value, ModuleError> {
+        Err(ModuleError::Unsupported(format!(
+            "`{capability}` is not a stream here"
+        )))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -282,8 +303,29 @@ impl Bus {
         v
     }
 
-    /// Handles one request from an authenticated `subject`.
+    /// Whether `capability` is a call or a stream on this device.
+    pub fn mode_of(&self, capability: &str) -> Option<Mode> {
+        self.caps.get(capability).map(|r| r.capability.mode)
+    }
+
+    /// Handles one `call` request from an authenticated `subject`.
     pub async fn handle(&self, subject: Subject, request: Request) -> Response {
+        match self.open(subject, request, Mode::Call).await {
+            Ok(session) => session.run_call().await,
+            Err(answer) => answer,
+        }
+    }
+
+    /// Runs every check for a request (membership, capability, target, schema, policy,
+    /// approval, indicator) and grants its lease. `Err` is the immediate answer: a
+    /// refusal, or the capability list. A refusal is journaled here; a [`Session`]
+    /// journals its outcome when it ends.
+    pub async fn open(
+        &self,
+        subject: Subject,
+        request: Request,
+        mode: Mode,
+    ) -> Result<Session<'_>, Response> {
         let mut event = Event {
             device: subject.device.to_string(),
             agent: subject.agent.as_deref().map(|a| truncate(a, 64)),
@@ -295,73 +337,125 @@ impl Bus {
             decision: "none".into(),
             ..Default::default()
         };
-        let response = self.process(&subject, request, &mut event).await;
-        event.outcome = match &response {
-            Response::Ok { .. } => "ok".into(),
-            Response::Error { code, .. } => code.as_str().into(),
-        };
-        if let Err(e) = self.journal.append(event) {
-            tracing::error!("journal write failed: {e}");
+        match self.check(&subject, request, mode, &mut event).await {
+            Ok((reg, target, input, verdict, indicator)) => {
+                let lease = self.leases.grant(
+                    subject.clone(),
+                    &reg.capability.name,
+                    target.clone(),
+                    verdict.lease_secs,
+                );
+                if let Some(i) = &indicator {
+                    i.show(lease.info());
+                }
+                Ok(Session {
+                    bus: self,
+                    reg,
+                    subject,
+                    target,
+                    input,
+                    lease,
+                    indicator,
+                    event,
+                })
+            }
+            Err(answer) => {
+                event.outcome = match &answer {
+                    Response::Ok { .. } => "ok".into(),
+                    Response::Error { code, .. } => code.as_str().into(),
+                };
+                if let Err(e) = self.journal.append(event) {
+                    tracing::error!("journal write failed: {e}");
+                }
+                Err(answer)
+            }
         }
-        response
     }
 
-    async fn process(&self, subject: &Subject, request: Request, event: &mut Event) -> Response {
+    #[allow(clippy::type_complexity)]
+    async fn check(
+        &self,
+        subject: &Subject,
+        request: Request,
+        mode: Mode,
+        event: &mut Event,
+    ) -> Result<
+        (
+            &Registered,
+            Option<String>,
+            Value,
+            Verdict,
+            Option<Arc<dyn Indicator>>,
+        ),
+        Response,
+    > {
         if !self.members.is_member(&subject.device) {
-            return Response::error(
+            return Err(Response::error(
                 ErrorCode::NotMember,
                 "this device is not a member of the group",
-            );
+            ));
         }
         if subject
             .agent
             .as_deref()
             .is_some_and(|a| !valid_agent_name(a))
         {
-            return Response::error(ErrorCode::InvalidInput, "invalid agent name");
+            return Err(Response::error(
+                ErrorCode::InvalidInput,
+                "invalid agent name",
+            ));
         }
         if request.capability == LIST_CAPABILITY {
             event.decision = "allow".into();
-            return Response::Ok {
+            return Err(Response::Ok {
                 output: json!({ "capabilities": self.listing_for(subject) }),
-            };
+            });
         }
         let Some(reg) = self.caps.get(&request.capability) else {
-            return Response::error(
+            return Err(Response::error(
                 ErrorCode::UnknownCapability,
                 "no such capability on this device",
-            );
+            ));
         };
         let cap = &reg.capability;
-        if cap.mode == Mode::Stream {
-            return Response::error(ErrorCode::Unsupported, "streams are not implemented yet");
+        if cap.mode != mode {
+            return Err(Response::error(
+                ErrorCode::Unsupported,
+                match cap.mode {
+                    Mode::Stream => "this capability is a stream: open it as one",
+                    Mode::Call => "this capability is a call, not a stream",
+                },
+            ));
         }
         match (&cap.target_kind, &request.target) {
             (Some(kind), None) => {
-                return Response::error(
+                return Err(Response::error(
                     ErrorCode::InvalidInput,
                     format!("a target of kind `{kind}` is required"),
-                );
+                ));
             }
             (None, Some(_)) => {
-                return Response::error(ErrorCode::InvalidInput, "this capability takes no target");
+                return Err(Response::error(
+                    ErrorCode::InvalidInput,
+                    "this capability takes no target",
+                ));
             }
             (_, Some(t))
                 if t.is_empty() || t.len() > MAX_TARGET_LEN || t.chars().any(char::is_control) =>
             {
-                return Response::error(ErrorCode::InvalidInput, "invalid target");
+                return Err(Response::error(ErrorCode::InvalidInput, "invalid target"));
             }
             _ => {}
         }
         if let Some(err) = reg.validator.iter_errors(&request.input).next() {
             // The path only: the error text may quote the input, which stays out of logs.
-            return Response::error(
+            return Err(Response::error(
                 ErrorCode::InvalidInput,
                 format!(
                     "input does not match the schema at `{}`",
                     err.instance_path()
                 ),
-            );
+            ));
         }
 
         let verdict = self.policy.read().expect("policy lock").evaluate(
@@ -377,7 +471,7 @@ impl Bus {
         }
         .into();
         match verdict.decision {
-            Decision::Deny => return Response::error(ErrorCode::Denied, "not allowed"),
+            Decision::Deny => return Err(Response::error(ErrorCode::Denied, "not allowed")),
             Decision::Allow => {}
             Decision::Ask => {
                 let ask = ApprovalRequest {
@@ -390,14 +484,14 @@ impl Bus {
                     Ok(ApprovalOutcome::Approved) => event.approved = Some(true),
                     Ok(ApprovalOutcome::Denied) => {
                         event.approved = Some(false);
-                        return Response::error(ErrorCode::Denied, "refused on the device");
+                        return Err(Response::error(ErrorCode::Denied, "refused on the device"));
                     }
                     Err(_) => {
                         event.approved = Some(false);
-                        return Response::error(
+                        return Err(Response::error(
                             ErrorCode::ApprovalTimeout,
                             "nobody answered in time",
-                        );
+                        ));
                     }
                 }
             }
@@ -407,10 +501,10 @@ impl Bus {
             IndicatorRequirement::Required => match &self.indicator {
                 Some(i) => Some(i.clone()),
                 None => {
-                    return Response::error(
+                    return Err(Response::error(
                         ErrorCode::NoIndicator,
                         "this device cannot show the required indicator",
-                    );
+                    ));
                 }
             },
             IndicatorRequirement::None => None,
@@ -418,36 +512,77 @@ impl Bus {
 
         // An approval can take a minute: the device may have been removed meanwhile.
         if !self.members.is_member(&subject.device) {
-            return Response::error(
+            return Err(Response::error(
                 ErrorCode::NotMember,
                 "this device is no longer a member of the group",
-            );
+            ));
         }
-        let lease = self.leases.grant(
-            subject.clone(),
-            &cap.name,
-            request.target.clone(),
-            verdict.lease_secs,
-        );
-        let lease_id = lease.info().id;
-        if let Some(i) = &indicator {
-            i.show(lease.info());
+        Ok((reg, request.target, request.input, verdict, indicator))
+    }
+}
+
+/// An accepted request: the module may run, inside its lease.
+pub struct Session<'a> {
+    bus: &'a Bus,
+    reg: &'a Registered,
+    subject: Subject,
+    target: Option<String>,
+    input: Value,
+    lease: LeaseHandle,
+    indicator: Option<Arc<dyn Indicator>>,
+    event: Event,
+}
+
+impl Session<'_> {
+    pub fn lease(&self) -> &LeaseHandle {
+        &self.lease
+    }
+
+    fn ctx(&self) -> Ctx {
+        Ctx {
+            subject: self.subject.clone(),
+            target: self.target.clone(),
+            lease: self.lease.clone(),
         }
-        let ctx = Ctx {
-            subject: subject.clone(),
-            target: request.target,
-            lease: lease.clone(),
-        };
+    }
+
+    /// Runs a `call` capability.
+    pub async fn run_call(self) -> Response {
+        let ctx = self.ctx();
+        let module = self.reg.module.clone();
+        let name = self.reg.capability.name.clone();
+        let input = self.input.clone();
+        let lease = self.lease.clone();
         let result = tokio::select! {
-            r = reg.module.invoke(ctx, &cap.name, request.input) => Some(r),
+            r = module.invoke(ctx, &name, input) => Some(r),
             reason = lease.ended() => { tracing::info!(?reason, "lease ended during invocation"); None }
         };
-        let interrupted = lease.state();
-        self.leases.finish(lease_id);
-        if let Some(i) = &indicator {
+        self.finish(result)
+    }
+
+    /// Runs a `stream` capability with the bytes `io` carries. The transport has told the
+    /// caller the stream is open before calling this.
+    pub async fn run_stream(self, io: StreamIo) -> Response {
+        let ctx = self.ctx();
+        let module = self.reg.module.clone();
+        let name = self.reg.capability.name.clone();
+        let input = self.input.clone();
+        let lease = self.lease.clone();
+        let result = tokio::select! {
+            r = module.invoke_stream(ctx, &name, input, io) => Some(r),
+            reason = lease.ended() => { tracing::info!(?reason, "lease ended during the stream"); None }
+        };
+        self.finish(result)
+    }
+
+    fn finish(self, result: Option<Result<Value, ModuleError>>) -> Response {
+        let interrupted = self.lease.state();
+        let lease_id = self.lease.info().id;
+        self.bus.leases.finish(lease_id);
+        if let Some(i) = &self.indicator {
             i.hide(lease_id);
         }
-        match result {
+        let response = match result {
             Some(Ok(output)) => Response::Ok { output },
             Some(Err(ModuleError::InvalidInput(m))) => Response::error(ErrorCode::InvalidInput, m),
             Some(Err(ModuleError::Unsupported(m))) => Response::error(ErrorCode::Unsupported, m),
@@ -461,7 +596,16 @@ impl Bus {
                     "the session was stopped on the device",
                 ),
             },
+        };
+        let mut event = self.event;
+        event.outcome = match &response {
+            Response::Ok { .. } => "ok".into(),
+            Response::Error { code, .. } => code.as_str().into(),
+        };
+        if let Err(e) = self.bus.journal.append(event) {
+            tracing::error!("journal write failed: {e}");
         }
+        response
     }
 }
 
