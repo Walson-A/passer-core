@@ -71,8 +71,34 @@ Relaying costs bandwidth. `relay.toml` can restrict it to your devices' ids
 
 - One server for many users (accounts, quotas): the code supports many groups per server
   (`MAX_GROUPS`), not billing or abuse handling.
-- A push gateway. To wake sleeping phones, run one next to the server and start it with
-  `passer-coord --wake-url http://gateway:8080/wake --wake-secret <secret>`
-  (`PASSER_COORD_WAKE_URL`, `PASSER_COORD_WAKE_SECRET`). The gateway receives
-  `POST {"token": "...", "group": "..."}` and sends a silent push with your Apple or Google
-  credentials. See `docs/integrating.md`.
+- Android (FCM) in the push gateway: only iPhones and iPads (APNs) can be woken today.
+
+## Waking sleeping phones (optional)
+
+A phone in a pocket does not listen: iOS suspends apps. To reach it, the coordination
+server asks a push gateway to send it a silent notification. `passer-push` is that
+gateway; it holds your Apple push key, so run it yourself, next to the server, never
+exposed to the internet.
+
+1. In Apple's developer site, create a key with Apple Push Notifications enabled; note its
+   id (10 characters) and your team id. Save the `.p8` file as `deploy/apns.p8` (git ignores
+   it).
+2. Next to `docker-compose.yml`, create `.env` (git ignores it too):
+
+   ```sh
+   PASSER_PUSH_SECRET=<a long random string>
+   PASSER_PUSH_APNS_KEY_ID=ABC123DEFG
+   PASSER_PUSH_APNS_TEAM_ID=TEAM456789
+   PASSER_PUSH_APNS_TOPIC=direct.passer.app
+   PASSER_COORD_WAKE_URL=http://push:8080/wake
+   ```
+
+3. `docker compose --profile push up -d --build`.
+
+Without Docker: `passer-push --secret <s> --apns-key key.p8 --apns-key-id <id>
+--apns-team-id <team> --apns-topic <bundle id>` (add `--apns-sandbox` for development
+builds), and `passer-coord --wake-url http://127.0.0.1:8080/wake --wake-secret <s>`.
+
+The gateway sends background notifications without content (`content-available`). iOS
+delivers them on a best-effort basis: usually within seconds, later in Low Power Mode or
+when an app is woken too often.

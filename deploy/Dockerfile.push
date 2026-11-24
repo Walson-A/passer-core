@@ -1,0 +1,14 @@
+# passer-push: the reference push gateway (wakes sleeping phones through APNs).
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p passer-push --locked
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* && useradd --system passer
+COPY --from=build /src/target/release/passer-push /usr/local/bin/passer-push
+USER passer
+# Reached only by the coordination server, on the compose network: no port published.
+ENV PASSER_PUSH_LISTEN=0.0.0.0:8080
+CMD ["passer-push"]

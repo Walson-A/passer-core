@@ -111,8 +111,10 @@ An independent review (separate from the author of the code) reported 12 finding
 - **Approvals on a sleeping phone** depend on the app: the core can wake it (push token,
   wake request), but the app must show the prompt within the 60 s an approval waits.
 - **Push tokens** are stored by the coordination server and handed to its push gateway. A
-  compromised server could send pushes to those tokens (notifications without content, or
-  whatever the gateway lets it send); the gateway should only send silent wake-ups.
+  compromised server could make the gateway send pushes to those tokens; `passer-push`
+  only ever sends silent, content-free wake-ups, at most one per device every 15 s (the
+  server's limit), and accepts requests only with its secret (compared in constant time).
+  It holds the APNs key: run it where only the server can reach it.
 - **A stream's lease bounds its life**, not its size: a long transfer needs a lease long
   enough, and a module must stop when its lease ends (the bus also cuts the stream).
 - **Agent identity is asserted by the bridge device.** A grant pinned with `via` only trusts

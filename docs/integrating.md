@@ -40,13 +40,14 @@ it will come.
   ([`self-hosting.md`](self-hosting.md)); apps then start with
   `NetworkKind::Relay { url }` and the server's address.
 
-- **Waking a sleeping phone**: the app passes its push token (APNs, FCM) to
-  `set_push_token`; the coordination server keeps it and, when another member cannot reach
-  the phone, hands it to a push gateway you run (`passer-coord --wake-url`). `call`,
-  `send_file` and `fetch_file` then retry for a few seconds. The gateway receives
-  `POST {"token": "...", "group": "..."}` and sends a silent notification; on receipt the app
-  starts its device for a moment. passer-core does not ship the gateway: it needs your
-  Apple and Google credentials.
+- **Waking a sleeping phone**: the app passes its push token to `set_push_token`, as
+  `apns:<hex device token>`; the coordination server keeps it and, when another member
+  cannot reach the phone, hands it to the push gateway (`passer-push`, see
+  [`self-hosting.md`](self-hosting.md)), which sends a silent notification. `call`,
+  `send_file` and `fetch_file` retry for a few seconds meanwhile. On the iPhone, the app
+  needs the Push Notifications capability and the `remote-notification` background mode,
+  registers for remote notifications, and, when one arrives, starts its device and keeps
+  it running for the few seconds iOS allows.
 
 - **A devices screen**: `members()` returns each member with what it last said about itself
   (kind, OS and version, app version, when it last answered); declare your own with
@@ -62,7 +63,7 @@ it will come.
 | A stable API (still 0.x) | the protocol and the types will change; apps built today will break | freeze the wire protocol and the `passer-ffi` surface, then semantic versioning |
 | Published packages | no crates.io release, no Swift Package / XCFramework, no Android AAR on Maven | release builds of `passer-ffi` with the generated bindings for each platform |
 | An external security audit | the code was reviewed, not audited | required before 1.0 |
-| A push gateway | the core carries tokens and wake requests; sending APNs/FCM pushes needs an app vendor's credentials | a small reference gateway, outside the core |
+| Android wake-ups | `passer-push` sends APNs only | FCM in the gateway |
 | Approvals on a sleeping phone | an approval waits 60 s; a woken phone must show it in time | needs the app's notification handling, then real-device testing |
 | Streams beyond files | screens and audio need datagrams or timed frames | with the screen project |
 | A hosted relay and coordination service | self-hosting works today; a service for people who will not run a server does not exist yet | Passer's service |

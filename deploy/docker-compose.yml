@@ -24,6 +24,27 @@ services:
       - "4433:4433/udp"
     volumes:
       - coord-data:/data
+    # With the push profile, the server wakes sleeping phones through the gateway.
+    environment:
+      PASSER_COORD_WAKE_URL: ${PASSER_COORD_WAKE_URL:-}
+      PASSER_COORD_WAKE_SECRET: ${PASSER_PUSH_SECRET:-}
+
+  # Optional: `docker compose --profile push up -d`, with PASSER_COORD_WAKE_URL set to
+  # http://push:8080/wake and the APNs settings below in a .env file next to this one.
+  push:
+    profiles: ["push"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.push
+    restart: unless-stopped
+    environment:
+      PASSER_PUSH_SECRET: ${PASSER_PUSH_SECRET:-}
+      PASSER_PUSH_APNS_KEY: /secrets/apns.p8
+      PASSER_PUSH_APNS_KEY_ID: ${PASSER_PUSH_APNS_KEY_ID:-}
+      PASSER_PUSH_APNS_TEAM_ID: ${PASSER_PUSH_APNS_TEAM_ID:-}
+      PASSER_PUSH_APNS_TOPIC: ${PASSER_PUSH_APNS_TOPIC:-direct.passer.app}
+    volumes:
+      - ./apns.p8:/secrets/apns.p8:ro
 
 volumes:
   relay-data:
