@@ -26,18 +26,25 @@ pub const STREAM_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 /// target sends nothing while it receives an upload; it ends when its lease ends.
 pub const STREAM_ANSWER_IDLE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
+/// Why a frame or chunk could not be written or read.
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
+    /// The frame or chunk is over its limit ([`MAX_FRAME`] or `MAX_CHUNK`); nothing was
+    /// allocated for it.
     #[error("frame of {0} bytes exceeds the {MAX_FRAME}-byte limit")]
     TooLarge(usize),
+    /// The QUIC stream failed (reset, closed early, connection lost).
     #[error("stream error: {0}")]
     Stream(String),
+    /// The frame is not valid JSON for the expected type.
     #[error("malformed frame: {0}")]
     Malformed(#[from] serde_json::Error),
+    /// The peer did not send in time.
     #[error("the peer was too slow")]
     Timeout,
 }
 
+/// Writes `value` as one JSON frame. Fails without sending if it exceeds [`MAX_FRAME`].
 pub async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<(), FrameError> {
     let bytes = serde_json::to_vec(value)?;
     if bytes.len() > MAX_FRAME {
@@ -102,6 +109,7 @@ pub async fn read_chunk(
     .map_err(|_| FrameError::Timeout)?
 }
 
+/// Reads one JSON frame, within [`READ_TIMEOUT`].
 pub async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, FrameError> {
     read_frame_within(recv, READ_TIMEOUT).await
 }

@@ -17,6 +17,8 @@
 //! the same checks ([`Bus::open`]), then exchanges bytes both ways for as long as its
 //! lease lives ([`Session::run_stream`], [`stream`]).
 
+#![warn(missing_docs)]
+
 pub mod capability;
 pub mod journal;
 pub mod lease;
@@ -51,28 +53,38 @@ pub const MAX_TARGET_LEN: usize = 256;
 /// `decision`.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Listed {
+    /// The capability as its module declares it.
     #[serde(flatten)]
     pub capability: Capability,
+    /// `allow` or `ask` for this requester. Denied capabilities are not listed.
     pub decision: Decision,
 }
 
 /// Read access to the group's membership, provided by whoever owns the device log.
 pub trait MembershipView: Send + Sync {
+    /// Whether `device` is a member of the group right now.
     fn is_member(&self, device: &DeviceId) -> bool;
 }
 
 /// What an approver device is asked.
 #[derive(Clone, Debug)]
 pub struct ApprovalRequest {
+    /// Who asks.
     pub subject: Subject,
+    /// What they want to invoke.
     pub capability: Capability,
+    /// The target, if the capability takes one.
     pub target: Option<String>,
+    /// How long the session lasts if approved, in seconds.
     pub lease_secs: u64,
 }
 
+/// A human's answer to an [`ApprovalRequest`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApprovalOutcome {
+    /// The human said yes.
     Approved,
+    /// The human said no, or nobody could be asked.
     Denied,
 }
 
@@ -80,6 +92,7 @@ pub enum ApprovalOutcome {
 /// on the phone, a dialog on the PC) and return the first answer.
 #[async_trait]
 pub trait Approver: Send + Sync {
+    /// Asks a human about `request`. The bus gives up after [`APPROVAL_TIMEOUT`].
     async fn approve(&self, request: &ApprovalRequest) -> ApprovalOutcome;
 }
 
@@ -96,24 +109,32 @@ impl Approver for NoApprover {
 /// A visible sign on the target device that a capability is running (a HUD, a frame
 /// around the screen), with a way to stop it.
 pub trait Indicator: Send + Sync {
+    /// Shows the indicator when the session of `lease` starts.
     fn show(&self, lease: &LeaseInfo);
+    /// Hides the indicator of lease `lease_id` when its session ends.
     fn hide(&self, lease_id: u64);
 }
 
 /// What a module receives with each invocation.
 pub struct Ctx {
+    /// Who invoked the capability.
     pub subject: Subject,
+    /// The target, present exactly when the capability declares a `target_kind`.
     pub target: Option<String>,
     /// Stop acting when this lease is no longer active.
     pub lease: LeaseHandle,
 }
 
+/// Why a module could not serve an invocation. Each variant maps to an [`ErrorCode`].
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleError {
+    /// The input matches the schema but makes no sense (`invalid_input`).
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// Not possible on this device or platform (`unsupported`).
     #[error("not supported here: {0}")]
     Unsupported(String),
+    /// Anything else that went wrong (`module_error`). The message is sent to the caller.
     #[error("{0}")]
     Failed(String),
 }
@@ -121,7 +142,10 @@ pub enum ModuleError {
 /// A set of capabilities served by one piece of code.
 #[async_trait]
 pub trait Module: Send + Sync {
+    /// The capabilities this module serves. Read once, when the bus is built.
     fn manifest(&self) -> Manifest;
+    /// Runs a `call` capability. The bus has already checked `input` against the schema
+    /// and the policy; stop when `ctx.lease` ends.
     async fn invoke(&self, ctx: Ctx, capability: &str, input: Value) -> Result<Value, ModuleError>;
 
     /// Runs a `stream` capability: read what the caller sends from `io.incoming`, send
@@ -140,14 +164,19 @@ pub trait Module: Send + Sync {
     }
 }
 
+/// Why [`BusBuilder::build`] refused the modules' manifests.
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
+    /// Two capabilities have the same name.
     #[error("capability `{0}` is declared twice")]
     Duplicate(String),
+    /// The name is not lowercase dotted segments (letters, digits, `_`, `-`), at most 96 bytes.
     #[error("capability name `{0}` is invalid")]
     BadName(String),
+    /// The input schema is not a valid JSON Schema.
     #[error("capability `{0}` has an invalid input schema: {1}")]
     BadSchema(String, String),
+    /// Names starting with `bus.` belong to the bus itself.
     #[error("`{0}` is reserved for the bus")]
     Reserved(String),
 }
@@ -169,6 +198,8 @@ pub struct BusBuilder {
 }
 
 impl BusBuilder {
+    /// A builder with no module, the default [`Policy`], no approver (every `ask` is
+    /// denied), no indicator and an in-memory journal. `members` decides who may call at all.
     pub fn new(members: Arc<dyn MembershipView>) -> Self {
         Self {
             modules: Vec::new(),
@@ -180,31 +211,37 @@ impl BusBuilder {
         }
     }
 
+    /// Adds a module.
     pub fn module(mut self, module: Arc<dyn Module>) -> Self {
         self.modules.push(module);
         self
     }
 
+    /// Sets the starting policy (the default policy otherwise).
     pub fn policy(mut self, policy: Policy) -> Self {
         self.policy = policy;
         self
     }
 
+    /// Sets who answers `ask` decisions ([`NoApprover`] otherwise).
     pub fn approver(mut self, approver: Arc<dyn Approver>) -> Self {
         self.approver = approver;
         self
     }
 
+    /// Installs the indicator. Without one, capabilities that require it are refused.
     pub fn indicator(mut self, indicator: Arc<dyn Indicator>) -> Self {
         self.indicator = Some(indicator);
         self
     }
 
+    /// Sets the journal (an in-memory one otherwise).
     pub fn journal(mut self, journal: Arc<Journal>) -> Self {
         self.journal = journal;
         self
     }
 
+    /// Checks every manifest (reserved names, names, schemas, duplicates) and builds the bus.
     pub fn build(self) -> Result<Bus, BuildError> {
         let mut caps = HashMap::new();
         for module in self.modules {
@@ -255,18 +292,22 @@ pub struct Bus {
 }
 
 impl Bus {
+    /// Starts a [`BusBuilder`]. `members` decides who may call at all.
     pub fn builder(members: Arc<dyn MembershipView>) -> BusBuilder {
         BusBuilder::new(members)
     }
 
+    /// The live sessions, to list or stop them.
     pub fn leases(&self) -> &Leases {
         &self.leases
     }
 
+    /// The journal every invocation is written to.
     pub fn journal(&self) -> &Journal {
         &self.journal
     }
 
+    /// Replaces the policy. Applies to new requests; running sessions keep their lease.
     pub fn set_policy(&self, policy: Policy) {
         *self.policy.write().expect("policy lock") = policy;
     }
@@ -534,6 +575,7 @@ pub struct Session<'a> {
 }
 
 impl Session<'_> {
+    /// The lease this session runs in.
     pub fn lease(&self) -> &LeaseHandle {
         &self.lease
     }

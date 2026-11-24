@@ -19,16 +19,22 @@ const RECENT: usize = 200;
 /// What gets written, without its own hash.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
+    /// Position in the chain, from 0.
     pub seq: u64,
+    /// When it was written, in seconds since the Unix epoch.
     pub at: u64,
+    /// The requester; on calls this device made, this device.
     pub device: String,
     /// Set on calls this device made: the member it called. Absent on received calls,
     /// so lines written before this field existed keep their hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
+    /// The AI agent the request came through, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Capability name, as requested.
     pub capability: String,
+    /// Target, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     /// `allow`, `ask` or `deny`, before any approval.
@@ -38,36 +44,52 @@ pub struct Record {
     pub approved: Option<bool>,
     /// `ok` or an error code.
     pub outcome: String,
+    /// Hash of the previous line (all zeros for the first).
     pub prev: String,
 }
 
 /// A record and its hash, as stored.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Line {
+    /// What was recorded.
     #[serde(flatten)]
     pub record: Record,
+    /// BLAKE3 hash of the record, in hex. The next line's `prev`.
     pub hash: String,
 }
 
 /// Fields the bus fills in; the journal adds sequence, time and chaining.
 #[derive(Clone, Debug, Default)]
 pub struct Event {
+    /// The requester; on calls this device made, this device.
     pub device: String,
+    /// The member called, on calls this device made.
     pub to: Option<String>,
+    /// The AI agent the request came through, if any.
     pub agent: Option<String>,
+    /// Capability name.
     pub capability: String,
+    /// Target, if any.
     pub target: Option<String>,
+    /// `allow`, `ask`, `deny`, or `none` when no policy check ran.
     pub decision: String,
+    /// Set when a human was asked: their answer.
     pub approved: Option<bool>,
+    /// `ok` or an error code.
     pub outcome: String,
 }
 
+/// Why the journal could not be read or written.
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
+    /// Reading or writing the file failed.
     #[error("journal I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// A line is not a valid [`Line`]. The number is its position, from 0.
     #[error("journal line {0} is malformed")]
     Malformed(u64),
+    /// A line does not follow from the one before (sequence, `prev` or hash): a line was
+    /// edited or removed. The number is its position, from 0.
     #[error("journal line {0} breaks the chain: a line was edited or removed")]
     Broken(u64),
 }
@@ -95,6 +117,7 @@ fn hash_record(r: &Record) -> String {
 }
 
 impl Journal {
+    /// A journal kept only in memory: nothing survives the process.
     pub fn in_memory() -> Self {
         Self {
             path: None,
@@ -164,10 +187,12 @@ impl Journal {
         Ok((head, n, recent))
     }
 
+    /// The file behind the journal, `None` when in memory.
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
 
+    /// Adds one line for `event`, chained to the previous one, and writes it to the file if any.
     pub fn append(&self, event: Event) -> Result<Line, JournalError> {
         let mut inner = self.inner.lock().expect("journal lock");
         let record = Record {

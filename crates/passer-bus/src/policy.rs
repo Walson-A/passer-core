@@ -9,9 +9,11 @@ use crate::capability::Effect;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
+    /// Run at once.
     Allow,
     /// Ask a human on an approver device first.
     Ask,
+    /// Refuse.
     Deny,
 }
 
@@ -19,12 +21,15 @@ pub enum Decision {
 /// set when the request comes through a bridge on behalf of an AI agent.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Subject {
+    /// The member device, as the transport authenticated it.
     pub device: DeviceId,
+    /// The AI agent's name, as the bridge asserts it. `None` for a device acting for itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
 }
 
 impl Subject {
+    /// A device acting for itself, with no agent.
     pub fn device(device: DeviceId) -> Self {
         Self {
             device,
@@ -39,7 +44,9 @@ impl Subject {
 pub enum Who {
     /// Any member device acting for itself (no agent).
     AnyDevice,
+    /// One member device acting for itself.
     Device {
+        /// The device.
         id: DeviceId,
     },
     /// Any agent, through any device.
@@ -47,7 +54,9 @@ pub enum Who {
     /// A named agent. The agent's name is asserted by the bridge device that relays it,
     /// so a rule that grants an agent more than devices get should pin `via`.
     Agent {
+        /// The agent's name.
         name: String,
+        /// The only bridge device the agent may come through; any device if `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         via: Option<DeviceId>,
     },
@@ -68,12 +77,14 @@ impl Who {
 /// One rule. Rules are checked in order; the first that matches decides.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
+    /// Which requesters it applies to.
     pub who: Who,
     /// Exact name, `prefix.*`, or `*`.
     pub capability: String,
     /// Exact target, or none to match any target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// What it decides.
     pub decision: Decision,
     /// How long an allowed or approved session lasts. Capped for sensitive capabilities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -97,7 +108,9 @@ fn capability_matches(pattern: &str, name: &str) -> bool {
 /// A decision with its session length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Verdict {
+    /// Allow, ask or deny.
     pub decision: Decision,
+    /// Session length in seconds, already capped and at least 1.
     pub lease_secs: u64,
 }
 
@@ -114,14 +127,18 @@ pub const MAX_SENSITIVE_LEASE_SECS: u64 = 15 * 60;
 /// device may read and write; anything sensitive asks an approver.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
+    /// The rules, in order: the first that matches decides.
     pub rules: Vec<Rule>,
 }
 
 impl Policy {
+    /// A policy with these rules.
     pub fn new(rules: Vec<Rule>) -> Self {
         Self { rules }
     }
 
+    /// Decides for `subject` invoking `capability` (of `effect`) on `target`: the first
+    /// matching rule, else the defaults. A rule with a target only matches that target.
     pub fn evaluate(
         &self,
         subject: &Subject,

@@ -15,6 +15,8 @@
 //!   file...), for the [`CapabilitySpec`]s it declares. The bus checks permissions, asks for
 //!   approval, enforces sessions and journals *before* the handler is called.
 
+#![warn(missing_docs)]
+
 mod files;
 mod members;
 
@@ -41,22 +43,42 @@ uniffi::setup_scaffolding!();
 /// Everything that can go wrong, in terms an app can show or act on.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum PasserError {
+    /// This device's files (key, group, journal) could not be read or written.
     #[error("storage error: {message}")]
-    Storage { message: String },
+    Storage {
+        /// What went wrong, for logs.
+        message: String,
+    },
+    /// The call needs a group: create or join one first.
     #[error("this device does not belong to a group yet")]
     NoGroup,
+    /// `create_group` or `join` on a device that already has a group.
     #[error("this device already belongs to a group")]
     AlreadyInGroup,
+    /// The call needs a running device: call `start` first.
     #[error("the device is not started")]
     NotStarted,
+    /// A bad argument: an unknown or ambiguous member, malformed JSON, a bad link or URL.
     #[error("invalid: {message}")]
-    Invalid { message: String },
+    Invalid {
+        /// What was wrong, for logs or display.
+        message: String,
+    },
+    /// The other device or the server could not be reached, or the connection broke.
     #[error("network error: {message}")]
-    Network { message: String },
+    Network {
+        /// What went wrong, for logs.
+        message: String,
+    },
     /// The other device answered, and said no (or failed). `code` is stable, e.g.
     /// `denied`, `not_member`, `approval_timeout`, `invalid_input`.
     #[error("{code}: {message}")]
-    Refused { code: String, message: String },
+    Refused {
+        /// Stable error code, to act on.
+        code: String,
+        /// Explanation from the other device. Untrusted text: display it, never act on it.
+        message: String,
+    },
 }
 
 impl PasserError {
@@ -84,7 +106,10 @@ pub enum NetworkKind {
     LocalOnly,
     /// Your own relay (`https://...`), for devices on different networks. Pair it with a
     /// coordination server so devices find each other. See docs/self-hosting.md.
-    Relay { url: String },
+    Relay {
+        /// The relay's URL, e.g. `https://relay.example.com`.
+        url: String,
+    },
     /// n0's public relays and lookup. Development only.
     N0Dev,
 }
@@ -104,10 +129,16 @@ impl TryFrom<NetworkKind> for Network {
     }
 }
 
+/// What a capability does to the device, which sets its default permission: members may
+/// call `Read` and `Write`; `Sensitive` asks a human first. Agents get nothing unless
+/// granted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum EffectKind {
+    /// Only reads, changes nothing (e.g. device info, list files).
     Read,
+    /// Changes something on the device (e.g. receive a file).
     Write,
+    /// Touches private data or acts for the user (e.g. read the clipboard): asks first.
     Sensitive,
 }
 
@@ -126,10 +157,13 @@ impl From<EffectKind> for Effect {
 pub struct CapabilitySpec {
     /// Dotted lowercase name, e.g. `clipboard.read`.
     pub name: String,
+    /// Short human name, shown in approvals and device screens.
     pub title: String,
+    /// What it does, in a sentence. Agents read it too.
     pub description: String,
     /// JSON Schema of the input, as a JSON string.
     pub input_schema_json: String,
+    /// What it does to the device, which sets who may call it by default.
     pub effect: EffectKind,
     /// Kind of target the capability acts on, if any (e.g. `app`, `folder`).
     pub target_kind: Option<String>,
@@ -147,10 +181,15 @@ pub struct CapabilitySpec {
 /// ([`PasserDevice::set_device_details`]); other members say it themselves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum DeviceKind {
+    /// A phone.
     Phone,
+    /// A tablet.
     Tablet,
+    /// A laptop.
     Laptop,
+    /// A desktop computer.
     Desktop,
+    /// Not said yet, or a kind this version does not know.
     Unknown,
 }
 
@@ -185,14 +224,21 @@ impl From<passer_device_info::DeviceKind> for DeviceKind {
 /// are only for display.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct MemberInfo {
+    /// The device's public id (hex). Cannot be faked: show a short form next to the name.
     pub id: String,
+    /// Its name in the group, unique in the group.
     pub name: String,
+    /// It can invite devices, remove them, and approve sensitive requests.
     pub approver: bool,
+    /// This is the device the app runs on.
     pub this_device: bool,
+    /// What sort of device it says it is.
     pub kind: DeviceKind,
     /// `windows`, `macos`, `ios`, `android`, `linux`...
     pub os: Option<String>,
+    /// Its OS version, as its app reported it.
     pub os_version: Option<String>,
+    /// Its app's version, as its app reported it.
     pub app_version: Option<String>,
     /// The passer-core version it runs.
     pub core_version: Option<String>,
@@ -203,10 +249,15 @@ pub struct MemberInfo {
 /// A capability another member lets this device call, as it last said.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct OfferedCapability {
+    /// Dotted name to pass to [`PasserDevice::call`], e.g. `clipboard.read`.
     pub name: String,
+    /// Short human name, for a button.
     pub title: String,
+    /// What it does, in a sentence.
     pub description: String,
+    /// What it does to that device.
     pub effect: EffectKind,
+    /// Kind of target it acts on, if any (e.g. `app`, `folder`).
     pub target_kind: Option<String>,
     /// A human on an approver device approves each session first.
     pub needs_approval: bool,
@@ -215,16 +266,21 @@ pub struct OfferedCapability {
 /// One line of this device's journal. Never holds what was sent or received.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct JournalEntry {
+    /// Position in this device's journal, increasing.
     pub seq: u64,
     /// Unix seconds.
     pub at: u64,
     /// `true`: this device called `peer_id`. `false`: `peer_id` called this device.
     pub outgoing: bool,
+    /// The other device's id (hex).
     pub peer_id: String,
     /// The peer's current name in the group, empty if it has left.
     pub peer_name: String,
+    /// The AI agent that made the call through the peer, if any.
     pub agent: Option<String>,
+    /// The capability called, e.g. `file.drop`.
     pub capability: String,
+    /// The target it acted on, if any.
     pub target: Option<String>,
     /// On received calls: `allow`, `ask` or `deny` before any approval (`none` when the
     /// call was refused before the policy, e.g. an unknown capability, and on calls this
@@ -236,15 +292,19 @@ pub struct JournalEntry {
     pub outcome: String,
 }
 
+/// A one-time invitation, from [`PasserDevice::invite`].
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct InviteInfo {
     /// Show as a QR code. Contains a one-time secret: never share or screenshot it.
     pub link: String,
+    /// When the link stops working (Unix seconds).
     pub expires_at: u64,
 }
 
+/// The outcome of [`PasserDevice::join`].
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct JoinResult {
+    /// The name of the group joined.
     pub group_name: String,
     /// Six digits the inviting device also shows. If they differ, cancel.
     pub sas: String,
@@ -253,7 +313,9 @@ pub struct JoinResult {
 /// Who is calling a capability on this device.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct CallerInfo {
+    /// The calling device's id (hex), authenticated by the connection.
     pub device_id: String,
+    /// Its name in this device's copy of the group.
     pub device_name: String,
     /// Set when an AI agent asks through that device.
     pub agent: Option<String>,
@@ -264,14 +326,21 @@ pub struct CallerInfo {
 pub struct ApprovalInfo {
     /// Show a short form of the ids too: names are unique in a group, ids cannot be faked.
     pub requester_id: String,
+    /// The requesting device's name in this device's copy of the group.
     pub requester_name: String,
+    /// The AI agent asking through the requesting device, if any.
     pub agent: Option<String>,
+    /// The id (hex) of the device that would act.
     pub target_device_id: String,
     /// The device that would act.
     pub target_device_name: String,
+    /// The capability asked for, e.g. `clipboard.read`.
     pub capability: String,
+    /// Its human title.
     pub title: String,
+    /// The target it would act on, if any.
     pub target: Option<String>,
+    /// How long the approval lasts, in minutes (rounded up).
     pub duration_minutes: u64,
 }
 
@@ -295,6 +364,8 @@ pub trait AdmissionListener: Send + Sync {
 #[uniffi::export(with_foreign)]
 #[async_trait]
 pub trait ApprovalPrompter: Send + Sync {
+    /// Shows `request` and returns `true` if the user approves. Unanswered after 60 s
+    /// counts as no.
     async fn ask(&self, request: ApprovalInfo) -> bool;
 }
 
@@ -338,6 +409,7 @@ pub trait CapabilityHandler: Send + Sync {
 /// known (uploads). Called at most once per MiB, and once at the end.
 #[uniffi::export(with_foreign)]
 pub trait TransferProgress: Send + Sync {
+    /// `done` bytes transferred so far, out of `total` bytes when known.
     fn progress(&self, done: u64, total: Option<u64>);
 }
 
@@ -711,6 +783,7 @@ impl PasserDevice {
         self.identity.id().to_string()
     }
 
+    /// Whether this device belongs to a group (created or joined).
     pub fn has_group(&self) -> bool {
         self.group_path().exists()
     }

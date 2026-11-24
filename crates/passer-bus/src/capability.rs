@@ -20,7 +20,9 @@ pub enum Effect {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
+    /// Answers once.
     Call,
+    /// Exchanges bytes both ways for as long as the lease lives.
     Stream,
 }
 
@@ -28,8 +30,11 @@ pub enum Mode {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndicatorRequirement {
+    /// No indicator needed.
     #[default]
     None,
+    /// Runs only on a device with an [`Indicator`](crate::Indicator) installed, shown for
+    /// the whole lease.
     Required,
 }
 
@@ -38,18 +43,24 @@ pub enum IndicatorRequirement {
 pub struct Capability {
     /// Dotted name, e.g. `device.info`, `transfer.drop`, `screen.view`.
     pub name: String,
+    /// Short human-readable name.
     pub title: String,
+    /// What it does, for people and AI agents.
     pub description: String,
     /// JSON Schema, validated on the target before anything runs.
     pub input_schema: Value,
+    /// JSON Schema of the output, if declared. The bus does not check it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<Value>,
+    /// How much it can do. Drives the default policy and the lease cap.
     pub effect: Effect,
+    /// Call or stream. A request only runs in the mode declared here.
     pub mode: Mode,
     /// Kind of target the capability acts on (e.g. `app` for the screen module).
     /// Policies can then differ per target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_kind: Option<String>,
+    /// Whether a visible indicator must be shown while it runs.
     #[serde(default)]
     pub indicator: IndicatorRequirement,
 }
@@ -80,8 +91,11 @@ impl Capability {
 /// Everything a module offers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
+    /// Name of the module.
     pub module: String,
+    /// Version of the module.
     pub version: String,
+    /// The capabilities it serves.
     pub capabilities: Vec<Capability>,
 }
 

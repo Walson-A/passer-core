@@ -9,6 +9,7 @@ use std::hash::Hash;
 use std::sync::Mutex;
 use std::time::Instant;
 
+/// A token-bucket rate limiter keyed by `K` (a device id, an address...).
 pub struct RateLimiter<K> {
     per_sec: f64,
     burst: f64,
@@ -17,6 +18,8 @@ pub struct RateLimiter<K> {
 }
 
 impl<K: Hash + Eq + Clone> RateLimiter<K> {
+    /// Allows `burst` events at once (at least 1), refilled at `per_minute`, tracking at
+    /// most `max_keys` keys.
     pub fn new(per_minute: u32, burst: u32, max_keys: usize) -> Self {
         Self {
             per_sec: f64::from(per_minute) / 60.0,

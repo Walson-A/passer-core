@@ -4,25 +4,34 @@
 //! name, kind, platform and software versions. Everything else (who may call it,
 //! journaling, sessions) is the bus's job: a module only describes and does.
 
+#![warn(missing_docs)]
+
 use async_trait::async_trait;
 use passer_bus::{Capability, Ctx, Effect, Manifest, Module, ModuleError};
 use serde_json::{Map, Value, json};
 
+/// The capability's name.
 pub const CAPABILITY: &str = "device.info";
 
 /// What sort of device this is, as the app knows it. The core cannot tell a laptop from
 /// a desktop, or a phone from a tablet: the app says.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DeviceKind {
+    /// A phone.
     Phone,
+    /// A tablet.
     Tablet,
+    /// A laptop.
     Laptop,
+    /// A desktop computer.
     Desktop,
+    /// Not said, or a kind this version does not know.
     #[default]
     Unknown,
 }
 
 impl DeviceKind {
+    /// The name sent in `device.info`: `phone`, `tablet`, `laptop`, `desktop`, `unknown`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Phone => "phone",
@@ -48,6 +57,7 @@ impl DeviceKind {
 /// What the app adds to the description: the core only knows the OS family.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Details {
+    /// What sort of device this is.
     pub kind: DeviceKind,
     /// e.g. `17.4` on iOS, `10.0.26100` on Windows.
     pub os_version: Option<String>,
@@ -70,6 +80,7 @@ impl DeviceInfo {
         }
     }
 
+    /// Adds what the app knows about the device (kind, OS and app versions).
     pub fn with_details(mut self, details: Details) -> Self {
         self.details = details;
         self

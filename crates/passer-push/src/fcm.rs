@@ -15,17 +15,23 @@ use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
 use serde::Deserialize;
 
 const SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
+/// Firebase Cloud Messaging's endpoint.
 pub const FCM_BASE: &str = "https://fcm.googleapis.com";
 
 /// The fields of a Firebase service account file (`service-account.json`) used here.
 #[derive(Deserialize)]
 pub struct ServiceAccount {
+    /// The Firebase project the app belongs to.
     pub project_id: String,
+    /// The service account's email, the JWT's issuer.
     pub client_email: String,
+    /// The account's RSA private key (PKCS#8 PEM). A secret: keep the file private.
     pub private_key: String,
+    /// Google's endpoint that trades the signed JWT for an access token.
     pub token_uri: String,
 }
 
+/// Sends wake-up data messages through Firebase Cloud Messaging.
 pub struct Fcm {
     account: ServiceAccount,
     key: RsaKeyPair,

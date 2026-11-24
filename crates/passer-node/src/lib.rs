@@ -13,6 +13,8 @@
 //! The transport authenticates the remote key (QUIC/TLS 1.3 with raw public keys); the
 //! node never trusts a device id written inside a message.
 
+#![warn(missing_docs)]
+
 pub mod approval;
 pub mod frame;
 pub mod limit;
@@ -35,13 +37,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::frame::{STREAM_IDLE, read_chunk, read_frame, write_chunk, write_end, write_frame};
 
+/// ALPN for capability calls and streams. Only current members may connect.
 pub const BUS_ALPN: &[u8] = b"passer-core/bus/1";
+/// ALPN for fetching the device log. Only current members may connect.
 pub const LOG_ALPN: &[u8] = b"passer-core/log/1";
+/// ALPN for redeeming an invitation; open to non-members, but read only while an
+/// invitation is pending.
 pub const JOIN_ALPN: &[u8] = b"passer-core/join/1";
 
 /// QUIC close code sent to a device that is not (or no longer) a member.
 const CLOSE_NOT_MEMBER: u32 = 403;
 
+/// The current Unix time in seconds (0 if the clock is before 1970).
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -65,6 +72,7 @@ pub struct Group {
 }
 
 impl Group {
+    /// Verifies `log` and, if `path` is given, writes it there (and on every change after).
     pub fn new(log: DeviceLog, path: Option<PathBuf>) -> anyhow::Result<Self> {
         let membership = log.verify().context("the device log does not verify")?;
         let group = Self {
@@ -75,6 +83,7 @@ impl Group {
         Ok(group)
     }
 
+    /// Reads, verifies and keeps persisting the log stored at `path`.
     pub fn load(path: PathBuf) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -103,10 +112,12 @@ impl Group {
         Ok(())
     }
 
+    /// A snapshot of the verified membership.
     pub fn membership(&self) -> Membership {
         self.inner.read().expect("group lock").membership.clone()
     }
 
+    /// A copy of the current device log.
     pub fn log(&self) -> DeviceLog {
         self.inner.read().expect("group lock").log.clone()
     }
@@ -157,6 +168,7 @@ impl Group {
 /// What [`Group::adopt`] did.
 #[derive(Debug, Default)]
 pub struct Adoption {
+    /// The received log replaced ours.
     pub changed: bool,
     /// Our branch lost a fork: entries written here since the fork point were dropped
     /// (for instance a device this device had added must be invited again).
@@ -400,7 +412,9 @@ async fn serve_stream(
 /// The caller's side of an open stream: send and receive through `io`, then await
 /// `done` for the target's result.
 pub struct OpenStream {
+    /// The caller's ends of the stream: chunks to send and chunks received.
     pub io: StreamIo,
+    /// Resolves to the target's final response once the stream ends or breaks.
     pub done: tokio::task::JoinHandle<anyhow::Result<Response>>,
 }
 
@@ -575,6 +589,7 @@ impl PeerBook {
         map.insert(addr.id, entry);
     }
 
+    /// The known addresses of `device`, or its bare id (left to address lookup) if none.
     pub fn addr_of(&self, device: &DeviceId) -> EndpointAddr {
         self.0
             .read()
@@ -610,6 +625,7 @@ pub(crate) async fn call_peer(
 /// How to run a node.
 #[derive(Clone)]
 pub struct NodeOptions {
+    /// How the endpoint reaches other devices.
     pub network: Network,
     /// Told about each admitted device, with the SAS code to show.
     pub on_admitted: Option<AdmissionHook>,
@@ -640,6 +656,8 @@ pub struct Node {
 }
 
 impl Node {
+    /// Binds an endpoint with this device's key and starts serving the bus, log and join
+    /// protocols.
     pub async fn spawn(
         identity: Arc<Identity>,
         group: Arc<Group>,
@@ -708,18 +726,22 @@ impl Node {
         &self.peers
     }
 
+    /// This device's id.
     pub fn id(&self) -> DeviceId {
         self.identity.id()
     }
 
+    /// The underlying iroh endpoint.
     pub fn endpoint(&self) -> &Endpoint {
         self.router.endpoint()
     }
 
+    /// The group as this device knows it.
     pub fn group(&self) -> &Arc<Group> {
         &self.group
     }
 
+    /// The bus that serves incoming capability requests.
     pub fn bus(&self) -> &Arc<Bus> {
         &self.bus
     }
@@ -916,6 +938,7 @@ impl Node {
         }
     }
 
+    /// Stops accepting connections and closes the endpoint.
     pub async fn shutdown(self) -> anyhow::Result<()> {
         self.router
             .shutdown()

@@ -13,6 +13,8 @@
 //! the app for a few seconds, enough to start its device and answer. iOS delivers these
 //! on a best-effort basis and may delay them when the phone is in Low Power Mode.
 
+#![warn(missing_docs)]
+
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -34,6 +36,7 @@ pub use fcm::{FCM_BASE, Fcm};
 /// Apple's production and development (sandbox) endpoints. Builds installed from Xcode or
 /// EAS development profiles use the sandbox; TestFlight and the App Store use production.
 pub const APNS_PRODUCTION: &str = "https://api.push.apple.com";
+/// See [`APNS_PRODUCTION`].
 pub const APNS_SANDBOX: &str = "https://api.sandbox.push.apple.com";
 /// Apple refuses tokens older than an hour and asks not to renew them more than every 20
 /// minutes.
@@ -105,6 +108,8 @@ pub struct Apns {
 }
 
 impl Apns {
+    /// Sends for the app whose bundle id is `topic`, to `base` ([`APNS_PRODUCTION`] or
+    /// [`APNS_SANDBOX`]).
     pub fn new(auth: ApnsAuth, topic: &str, base: &str) -> anyhow::Result<Self> {
         // ring, as everywhere else in the workspace. Installing twice is harmless.
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -159,7 +164,9 @@ impl Apns {
 pub struct Gateway {
     /// The bearer secret `passer-coord --wake-secret` sends.
     pub secret: String,
+    /// Sends `apns:` tokens; without it, they are refused.
     pub apns: Option<Apns>,
+    /// Sends `fcm:` tokens; without it, they are refused.
     pub fcm: Option<Fcm>,
 }
 

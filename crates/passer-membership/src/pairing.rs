@@ -32,9 +32,14 @@ pub const MAX_TTL_SECS: u64 = 15 * 60;
 /// An offer, from an approver, to add one device to the group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invitation {
+    /// The group the device is invited into.
     pub group: GroupId,
+    /// The approver who issued it, and to whom the join request is sent.
     pub inviter: DeviceId,
+    /// One-time random secret that keys the join MAC and the SAS code. Whoever holds it
+    /// can join, so it travels only in the link.
     pub secret: [u8; 32],
+    /// Unix seconds after which the invitation is no longer accepted.
     pub expires_at: u64,
     /// Where the inviter can be reached directly (`ip:port`), for the local network.
     pub addrs: Vec<String>,
@@ -48,25 +53,35 @@ pub struct Invitation {
 /// Errors while pairing.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PairingError {
+    /// Not a join link, or a required parameter is missing or malformed.
     #[error("not a passer-core join link")]
     BadLink,
+    /// The link's format version is newer than this build understands.
     #[error("this link uses a newer format; update the app")]
     UnsupportedVersion,
+    /// No pending, unexpired invitation matches the request's group, inviter and MAC.
     #[error("no pending invitation matches this request")]
     UnknownInvitation,
+    /// The invitation's expiry time has passed.
     #[error("the invitation has expired")]
     Expired,
+    /// The request's device key is not the key the transport authenticated.
     #[error("the request does not match the invitation")]
     Mismatch,
+    /// The request's signature does not verify against its device key.
     #[error("the request is not signed by the connecting device")]
     BadSignature,
+    /// The inviter does not have the approver role in the group.
     #[error("the inviter is not an approver of this group")]
     NotApprover,
+    /// The requested device name fails [`crate::is_valid_name`].
     #[error("the device name is not acceptable")]
     BadName,
 }
 
 impl Invitation {
+    /// A fresh invitation with a random secret, valid `ttl_secs` from `now` (Unix seconds),
+    /// capped at [`MAX_TTL_SECS`]. No relay, and the joiner will not be an approver.
     pub fn new(
         group: GroupId,
         inviter: DeviceId,
@@ -199,17 +214,25 @@ pub fn valid_relay(url: &str) -> bool {
 /// What a joining device sends to the inviter.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinRequest {
+    /// The group named in the invitation.
     pub group: GroupId,
+    /// The inviter named in the invitation.
     pub inviter: DeviceId,
+    /// The joining device's key.
     pub device: DeviceId,
+    /// The name it asks to join under.
     pub name: String,
+    /// Keyed BLAKE3 of group, inviter, device and name under the invitation secret:
+    /// proves the joiner saw the invitation without revealing the secret.
     #[serde(with = "crate::hex_array")]
     pub mac: [u8; 32],
+    /// The joiner's signature over the same fields: proves it holds `device`'s key.
     #[serde(with = "crate::hex_sig")]
     pub sig: Signature,
 }
 
 impl JoinRequest {
+    /// Builds and signs the request `joiner` sends to answer `invitation` under `name`.
     pub fn new(joiner: &Identity, invitation: &Invitation, name: &str) -> Self {
         let device = joiner.id();
         let bytes = join_bytes(&invitation.group, &invitation.inviter, &device, name);
@@ -254,18 +277,24 @@ pub struct InvitationBook {
 /// A redeemed invitation: who joins, and the code to show.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Admission {
+    /// The joining device's key, as authenticated by the transport.
     pub device: DeviceId,
+    /// The name it asked for (valid, but not yet checked for uniqueness in the group).
     pub name: String,
+    /// The 6-digit [`sas_code`] to show, for comparison with the joiner's screen.
     pub sas: String,
     /// Taken from the inviter's own copy of the invitation, never from the request.
     pub approver: bool,
 }
 
 impl InvitationBook {
+    /// Records an invitation as pending, so a matching join request can redeem it.
     pub fn issue(&mut self, invitation: Invitation) {
         self.pending.push(invitation);
     }
 
+    /// How many invitations are pending, expired ones included until the next
+    /// [`InvitationBook::redeem`] prunes them.
     pub fn pending(&self) -> usize {
         self.pending.len()
     }

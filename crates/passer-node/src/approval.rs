@@ -28,6 +28,7 @@ use tokio::task::JoinSet;
 
 use crate::{Group, PeerBook, call_peer};
 
+/// The capability an approver device serves to show approval prompts for other devices.
 pub const APPROVAL_CAPABILITY: &str = "approval.request";
 
 /// What a human is asked, in words they can judge.
@@ -35,16 +36,21 @@ pub const APPROVAL_CAPABILITY: &str = "approval.request";
 pub struct ApprovalPrompt {
     /// The device that wants something done.
     pub requester: DeviceId,
+    /// The requester's name, from this device's own copy of the membership log.
     pub requester_name: String,
     /// Set when an AI agent asks through that device.
     pub agent: Option<String>,
     /// The device that would do it.
     pub target_device: DeviceId,
+    /// The target's name, from this device's own copy of the membership log.
     pub target_device_name: String,
+    /// The capability's name (e.g. `file.drop`).
     pub capability: String,
+    /// The capability's human-readable title.
     pub title: String,
     /// What the capability acts on (an app, a folder), if anything.
     pub target: Option<String>,
+    /// How long the approval would last, in seconds.
     pub lease_secs: u64,
 }
 
@@ -66,6 +72,8 @@ impl ApprovalPrompt {
 /// Shows a prompt to the person in front of this device and returns their answer.
 #[async_trait]
 pub trait Prompter: Send + Sync {
+    /// Shows `prompt` and returns `true` only on an explicit yes. Strings are already
+    /// sanitized and bounded.
     async fn ask(&self, prompt: &ApprovalPrompt) -> bool;
 }
 
@@ -129,6 +137,7 @@ impl Drop for Release<'_> {
 pub const PROMPTS_PER_MINUTE: u32 = 6;
 
 impl ApprovalModule {
+    /// Serves prompts through `prompter`, naming devices from `group`.
     pub fn new(group: Arc<Group>, prompter: Arc<dyn Prompter>) -> Self {
         Self {
             group,
@@ -249,6 +258,8 @@ pub struct RemoteApprover {
 }
 
 impl RemoteApprover {
+    /// An approver that asks `local` (if any) and the group's other approvers. It can
+    /// reach other devices only once given to a node through [`crate::NodeOptions`].
     pub fn new(group: Arc<Group>, local: Option<Arc<dyn Prompter>>) -> Arc<Self> {
         Arc::new(Self {
             group,

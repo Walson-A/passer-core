@@ -17,6 +17,8 @@
 //! The same server runs as Passer's hosted service (many groups) or inside a self-hosted
 //! Atlas engine (one group).
 
+#![warn(missing_docs)]
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -36,6 +38,7 @@ mod wake;
 pub use wake::{HttpWakeHook, MAX_TOKEN, WAKE_ALPN, WAKE_INTERVAL_SECS, WakeHook, wake};
 use wake::{WakeReply, WakeRequest};
 
+/// The ALPN of the coordination protocol (publish a log and presence, get the group's).
 pub const COORD_ALPN: &[u8] = b"passer-core/coord/1";
 /// A device not seen for this long is reported offline.
 pub const PRESENCE_TTL_SECS: u64 = 5 * 60;
@@ -45,11 +48,14 @@ const MAX_ADDRS: usize = 8;
 /// A device's last known whereabouts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Presence {
+    /// The device.
     pub device: DeviceId,
+    /// Its direct addresses (`ip:port`), as it reported them; at most 8.
     pub addrs: Vec<SocketAddr>,
     /// The relay it is reachable through, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<String>,
+    /// When it last reported them (Unix seconds).
     pub seen_at: u64,
 }
 
@@ -66,19 +72,25 @@ struct Publish {
     push: Option<String>,
 }
 
+/// The server's answer to a publish.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Reply {
     /// The server's current log and the other members' presence.
     Ok {
+        /// The group's log the server keeps (the publisher's, if it extended it).
         log: DeviceLog,
+        /// The other members seen in the last [`PRESENCE_TTL_SECS`].
         presence: Vec<Presence>,
     },
     /// The publishing device is no longer a member; here is the log that says so.
     Removed {
+        /// The server's log, which records the removal.
         log: DeviceLog,
     },
+    /// The publish was refused (a log that does not verify, a fork, a full server...).
     Error {
+        /// Why, for logs.
         message: String,
     },
 }
@@ -468,10 +480,12 @@ impl Server {
         Ok(Self { router, state })
     }
 
+    /// The server's iroh endpoint; its id is the server's key, which devices pin.
     pub fn endpoint(&self) -> &Endpoint {
         self.router.endpoint()
     }
 
+    /// The groups this server keeps.
     pub fn state(&self) -> &State {
         &self.state
     }
@@ -489,6 +503,7 @@ impl Server {
         addr
     }
 
+    /// Stops accepting connections and closes the endpoint.
     pub async fn shutdown(self) -> anyhow::Result<()> {
         self.router
             .shutdown()
@@ -524,7 +539,9 @@ pub fn parse_server(s: &str) -> anyhow::Result<EndpointAddr> {
 /// What a device learned from one exchange with the server.
 #[derive(Debug)]
 pub struct SyncOutcome {
+    /// How many members the group has, per this device's log after the exchange.
     pub members: usize,
+    /// The other members the server saw recently, and that this device's log lists.
     pub online: Vec<Presence>,
     /// True when the server says this device has been removed from the group.
     pub removed: bool,

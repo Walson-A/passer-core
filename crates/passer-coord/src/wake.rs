@@ -29,6 +29,7 @@ use passer_node::frame::{read_frame, write_frame};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// The ALPN on which a member asks the server to wake another member.
 pub const WAKE_ALPN: &[u8] = b"passer-core/wake/1";
 /// A device is woken at most this often.
 pub const WAKE_INTERVAL_SECS: u64 = 15;

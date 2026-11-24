@@ -15,6 +15,8 @@
 //! (Keychain `ThisDeviceOnly`, Android Keystore) through `passer-ffi`. See `docs/security.md` for why the transport
 //! key is Ed25519 and how a hardware-bound root key is meant to sign it.
 
+#![warn(missing_docs)]
+
 #[cfg(windows)]
 mod dpapi;
 #[cfg(windows)]
@@ -51,8 +53,11 @@ pub type DeviceId = PublicKey;
 /// Errors from this crate.
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
+    /// Reading or writing the key file failed.
     #[error("key store I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// The stored key is unreadable: bad format, unknown version, wrong length, or it
+    /// could not be decrypted.
     #[error("key file is malformed")]
     Malformed,
 }
@@ -140,10 +145,13 @@ pub struct FileKeyStore {
 }
 
 impl FileKeyStore {
+    /// A store for the key file at `path`. Nothing is read or written until
+    /// [`KeyStore::load_or_create`].
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
 
+    /// Where the key file lives.
     pub fn path(&self) -> &Path {
         &self.path
     }

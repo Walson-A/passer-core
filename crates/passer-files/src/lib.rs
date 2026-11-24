@@ -10,6 +10,8 @@
 //! journals every transfer without its content. A transfer that breaks leaves nothing
 //! behind: the inbox only ever holds complete files.
 
+#![warn(missing_docs)]
+
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -17,8 +19,11 @@ use passer_bus::{Capability, Ctx, Effect, Manifest, Mode, Module, ModuleError, S
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Send a file into this device's inbox (write, stream).
 pub const DROP: &str = "file.drop";
+/// Get a file from this device's shared folder, by name (read, stream).
 pub const GET: &str = "file.get";
+/// List this device's shared folder (read).
 pub const LIST: &str = "file.list";
 /// Most files `file.list` returns.
 pub const MAX_LISTED: usize = 500;
@@ -37,6 +42,7 @@ pub struct Files {
 }
 
 impl Files {
+    /// A module that offers nothing until given an inbox or a shared folder.
     pub fn new() -> Self {
         Self {
             inbox: None,
@@ -57,6 +63,7 @@ impl Files {
         self
     }
 
+    /// Largest file `file.drop` accepts, in bytes (default [`DEFAULT_MAX_BYTES`], 4 GiB).
     pub fn max_bytes(mut self, max: u64) -> Self {
         self.max_bytes = max;
         self

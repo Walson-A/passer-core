@@ -14,11 +14,16 @@ use crate::{FileKeyStore, Identity, IdentityError, KeyStore};
 
 const SERVICE: &str = "passer-core";
 
+/// Stores the device key in the system keyring, one entry per key path, falling back to
+/// an owner-only file at that path when no keyring is usable.
 pub struct KeyringKeyStore {
     path: PathBuf,
 }
 
 impl KeyringKeyStore {
+    /// A store for the key named by `path`: the keyring entry is keyed by its absolute
+    /// form, and the file fallback lives there. Nothing is touched until
+    /// [`KeyStore::load_or_create`].
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }

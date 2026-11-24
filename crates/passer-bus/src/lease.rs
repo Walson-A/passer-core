@@ -17,8 +17,11 @@ use crate::policy::Subject;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "reason", content = "detail", rename_all = "snake_case")]
 pub enum EndReason {
+    /// The invocation completed.
     Finished,
+    /// Its duration ran out.
     Expired,
+    /// Stopped on the device (stop button, device removed), with the reason.
     Revoked(String),
 }
 
@@ -26,19 +29,26 @@ pub enum EndReason {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", content = "detail", rename_all = "snake_case")]
 pub enum LeaseState {
+    /// Running.
     Active,
     /// Paused, e.g. because the user touched the mouse. Can resume.
     Suspended(String),
+    /// Over for good.
     Ended(EndReason),
 }
 
 /// What a lease covers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct LeaseInfo {
+    /// Unique for the life of the bus, from 1.
     pub id: u64,
+    /// Who the lease was granted to.
     pub subject: Subject,
+    /// The capability it runs.
     pub capability: String,
+    /// Target, if any.
     pub target: Option<String>,
+    /// Longest it may last, in seconds.
     pub duration_secs: u64,
 }
 
@@ -51,10 +61,12 @@ pub struct LeaseHandle {
 }
 
 impl LeaseHandle {
+    /// What the lease covers.
     pub fn info(&self) -> &LeaseInfo {
         &self.info
     }
 
+    /// Where the lease stands. `Ended(Expired)` once the deadline has passed.
     pub fn state(&self) -> LeaseState {
         let state = self.tx.borrow().clone();
         match state {
@@ -64,6 +76,7 @@ impl LeaseHandle {
         }
     }
 
+    /// Whether the module may act right now (not suspended, not ended).
     pub fn is_active(&self) -> bool {
         self.state() == LeaseState::Active
     }
@@ -80,6 +93,7 @@ impl LeaseHandle {
         });
     }
 
+    /// Resumes a suspended session. Does nothing otherwise.
     pub fn resume(&self) {
         self.tx.send_if_modified(|s| match s {
             LeaseState::Suspended(_) => {
@@ -182,6 +196,7 @@ impl Leases {
         v
     }
 
+    /// The live lease with this id, if any.
     pub fn get(&self, id: u64) -> Option<LeaseHandle> {
         self.live.lock().expect("lease lock").get(&id).cloned()
     }

@@ -34,10 +34,13 @@ pub struct DpapiKeyStore {
 }
 
 impl DpapiKeyStore {
+    /// A store for the DPAPI-protected key file at `path`. Nothing is read or written
+    /// until [`KeyStore::load_or_create`].
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
 
+    /// Where the protected key file lives.
     pub fn path(&self) -> &Path {
         &self.path
     }

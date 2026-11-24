@@ -19,15 +19,18 @@ const BUFFERED: usize = 8;
 /// What the transport hands to [`Incoming`].
 #[derive(Debug)]
 pub enum Chunk {
+    /// A piece of what the peer sent.
     Data(Vec<u8>),
     /// The peer finished sending.
     End,
 }
 
+/// The incoming stream broke before the peer said it was done: what arrived is incomplete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the stream broke before the peer finished sending")]
 pub struct StreamBroken;
 
+/// The peer no longer reads: nothing more can be sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("the peer no longer reads this stream")]
 pub struct StreamClosed;
@@ -75,7 +78,9 @@ impl Outgoing {
 
 /// Both directions, as a module sees them.
 pub struct StreamIo {
+    /// What the peer sends.
     pub incoming: Incoming,
+    /// What this side sends back.
     pub outgoing: Outgoing,
 }
 

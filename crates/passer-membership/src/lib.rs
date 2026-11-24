@@ -15,6 +15,8 @@
 //!
 //! Pairing (adding a device) lives in [`pairing`].
 
+#![warn(missing_docs)]
+
 pub mod pairing;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,6 +37,7 @@ pub const MAX_LOG_ENTRIES: usize = 4096;
 pub struct Digest(#[serde(with = "hex_array")] pub [u8; 32]);
 
 impl Digest {
+    /// All zeros: the `prev` of the genesis entry.
     pub const ZERO: Digest = Digest([0; 32]);
 }
 
@@ -58,27 +61,43 @@ pub type GroupId = Digest;
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
     /// Creates the group. Its author becomes the first member, with the approver role.
-    Genesis { group: String, device_name: String },
+    Genesis {
+        /// The group's display name.
+        group: String,
+        /// The founding device's name.
+        device_name: String,
+    },
     /// Adds a device. Only an approver may write it.
     Add {
+        /// The new member's key.
         device: DeviceId,
+        /// Its name, unique in the group (see [`same_name`]).
         name: String,
+        /// Whether it may add and remove devices too.
         approver: bool,
     },
     /// Removes (revokes) a device. An approver may remove anyone; a member may remove itself.
-    Remove { device: DeviceId },
+    Remove {
+        /// The device to revoke.
+        device: DeviceId,
+    },
 }
 
 /// One signed line of the log.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
+    /// Position in the log, from 0.
     pub seq: u64,
+    /// [`Entry::digest`] of the previous entry, [`Digest::ZERO`] for the genesis.
     pub prev: Digest,
     /// Unix seconds, as claimed by the author. Informative only: clocks differ.
     pub at: u64,
+    /// The member who wrote and signed the entry.
     pub author: DeviceId,
+    /// The change it makes.
     #[serde(flatten)]
     pub op: Op,
+    /// The author's signature over `seq`, `prev`, `at`, `author` and `op`.
     #[serde(with = "hex_sig")]
     pub sig: Signature,
 }
@@ -145,32 +164,45 @@ fn put_str(b: &mut Vec<u8>, s: &str) {
 /// A member, as derived from the log.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Member {
+    /// The device's name, unique in the group.
     pub name: String,
+    /// Whether it may add and remove devices.
     pub approver: bool,
+    /// The approver that added it (itself for the founder).
     pub added_by: DeviceId,
+    /// `seq` of the entry that added it (0 for the founder); lower is more senior.
     pub added_at_seq: u64,
 }
 
 /// The verified state of a group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Membership {
+    /// The group's id (digest of the genesis entry).
     pub group: GroupId,
+    /// The group's display name.
     pub name: String,
+    /// Current members by key.
     pub members: BTreeMap<DeviceId, Member>,
+    /// Every key ever removed; none of them can be added again.
     pub revoked: BTreeSet<DeviceId>,
+    /// Digest of the last entry.
     pub head: Digest,
+    /// Number of entries in the log.
     pub len: u64,
 }
 
 impl Membership {
+    /// Whether `device` is currently a member.
     pub fn is_member(&self, device: &DeviceId) -> bool {
         self.members.contains_key(device)
     }
 
+    /// Whether `device` is currently a member with the approver role.
     pub fn is_approver(&self, device: &DeviceId) -> bool {
         self.members.get(device).is_some_and(|m| m.approver)
     }
 
+    /// The current approvers' keys.
     pub fn approvers(&self) -> impl Iterator<Item = &DeviceId> {
         self.members
             .iter()
@@ -180,40 +212,59 @@ impl Membership {
 }
 
 /// Why a log was rejected.
+///
+/// Where a variant carries a `u64`, it is the index of the offending entry.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MembershipError {
+    /// The log has no entries.
     #[error("the log is empty")]
     Empty,
+    /// The first entry is not a `Genesis`.
     #[error("entry {0}: the first entry must be a genesis")]
     NoGenesis(u64),
+    /// A `Genesis` appears after the first entry.
     #[error("entry {0}: genesis may only appear first")]
     LateGenesis(u64),
+    /// An entry's `seq` is not its position in the log.
     #[error("entry {0}: wrong sequence number")]
     BadSeq(u64),
+    /// An entry's `prev` is not the digest of the entry before it.
     #[error("entry {0}: does not chain to the previous entry")]
     BrokenChain(u64),
+    /// An entry's signature does not verify against its author.
     #[error("entry {0}: invalid signature")]
     BadSignature(u64),
+    /// An entry's author is not a member at that point of the log.
     #[error("entry {0}: author is not a member")]
     AuthorNotMember(u64),
+    /// The author lacks the right: a non-approver adding a device or removing another.
     #[error("entry {0}: author is not allowed to do this")]
     NotAllowed(u64),
+    /// The added device is already a member.
     #[error("entry {0}: device is already a member")]
     AlreadyMember(u64),
+    /// The added device was removed earlier; a revoked key never comes back.
     #[error("entry {0}: device was revoked and cannot come back")]
     Revoked(u64),
+    /// The removed device is not a member.
     #[error("entry {0}: device is not a member")]
     NotMember(u64),
+    /// The entry would remove the group's last approver.
     #[error("entry {0}: cannot remove the last approver")]
     LastApprover(u64),
+    /// A group or device name fails [`is_valid_name`].
     #[error("entry {0}: invalid device name")]
     BadName(u64),
+    /// The added name is the [`same_name`] as an existing member's.
     #[error("entry {0}: another member already has this name")]
     NameTaken(u64),
+    /// The log has more than [`MAX_LOG_ENTRIES`] entries.
     #[error("the log is longer than {MAX_LOG_ENTRIES} entries")]
     TooLong,
+    /// The update is not this log plus new entries (a fork or a rollback).
     #[error("the update does not extend the log this device already has (fork or rollback)")]
     NotAnExtension,
+    /// The other log belongs to a different group.
     #[error("the update belongs to another group")]
     OtherGroup,
 }
@@ -243,6 +294,7 @@ impl DeviceLog {
         Ok(log)
     }
 
+    /// All entries, oldest first.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
@@ -263,6 +315,7 @@ impl DeviceLog {
         }
     }
 
+    /// The group's id (digest of the first entry), `None` for an empty log.
     pub fn group_id(&self) -> Option<GroupId> {
         self.entries.first().map(Entry::digest)
     }
@@ -422,10 +475,13 @@ impl DeviceLog {
         })
     }
 
+    /// The log as pretty-printed JSON, the form it is stored and exchanged in.
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("log serializes")
     }
 
+    /// Parses a log from JSON. Does not verify it: call [`DeviceLog::verify`] or
+    /// [`DeviceLog::accept_update`] before trusting it.
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(s)
     }
@@ -449,8 +505,11 @@ impl DeviceLog {
 /// The outcome of [`DeviceLog::prefer`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Preferred {
+    /// Keep this log.
     Ours,
+    /// Switch to the other log.
     Theirs,
+    /// The two logs are identical.
     Same,
 }
 
