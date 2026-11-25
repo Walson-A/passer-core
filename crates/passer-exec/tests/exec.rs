@@ -145,6 +145,8 @@ async fn only_the_known_placeholders_are_filled() {
         to_module,
         mut from_module,
     } = peer;
+    // Done sending (a drop without `End` would be a broken stream).
+    to_module.send(Chunk::End).await.unwrap();
     drop(to_module);
     let mut got = Vec::new();
     while let Some(bytes) = from_module.recv().await {
@@ -181,11 +183,16 @@ async fn the_stop_button_kills_the_command() {
             .expect("allowed");
         session.run_stream(io).await
     });
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(
-        std::fs::metadata(&ticks).map(|m| m.len()).unwrap_or(0) > 0,
-        "it ran"
-    );
+    // A freshly built helper can take a while to start (antivirus scan on Windows).
+    let mut ran = false;
+    for _ in 0..100 {
+        if std::fs::metadata(&ticks).map(|m| m.len()).unwrap_or(0) > 0 {
+            ran = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ran, "it ran");
 
     bus.leases().revoke_all("stopped by the user");
     let result = tokio::time::timeout(Duration::from_secs(5), run)
@@ -223,4 +230,70 @@ async fn refusals() {
         session.run_stream(io).await.code(),
         Some(ErrorCode::InvalidInput)
     );
+}
+
+/// Runs `exec.stubborn` (writes forever, ignores its input) until the caller does `leave`,
+/// then returns how long the session took to end after that, and the HUD's log.
+async fn stubborn_until<F, Fut>(leave: F) -> (Duration, Vec<String>)
+where
+    F: FnOnce(stream::StreamPeer) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let hud = Arc::new(Hud::default());
+    let (bus, me) = make_bus(
+        vec![command("exec.stubborn", &["stubborn"], true)],
+        "iPhone",
+        Some(hud.clone()),
+    );
+    let (io, peer) = stream::pair();
+    let b = bus.clone();
+    let run = tokio::spawn(async move {
+        let session = b
+            .open(me, open("exec.stubborn"), Mode::Stream)
+            .await
+            .expect("allowed");
+        session.run_stream(io).await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let left = std::time::Instant::now();
+    leave(peer).await;
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("the session ended")
+        .unwrap();
+    let took = left.elapsed();
+    let log = hud.0.lock().unwrap().clone();
+    (took, log)
+}
+
+#[tokio::test]
+async fn a_caller_that_vanishes_ends_the_session_at_once() {
+    // The stream breaks (no `End`): the phone was closed, or the network dropped.
+    let (took, hud) = stubborn_until(|peer| async move { drop(peer) }).await;
+    assert!(took < Duration::from_secs(2), "took {took:?}");
+    assert_eq!(hud, vec!["show exec.stubborn", "hide"]);
+}
+
+#[tokio::test]
+async fn a_command_that_misses_the_end_is_killed_after_a_grace() {
+    // The caller says it is done but keeps reading; the command keeps writing.
+    let (took, hud) = stubborn_until(|peer| async move {
+        let stream::StreamPeer {
+            to_module,
+            mut from_module,
+        } = peer;
+        to_module.send(Chunk::End).await.unwrap();
+        tokio::spawn(async move {
+            // Keep the sender alive (a clean end, not a break) and drain the output.
+            let _keep = to_module;
+            while from_module.recv().await.is_some() {}
+        });
+    })
+    .await;
+    // Killed after the 3 s grace, not before, and not never.
+    assert!(
+        took >= Duration::from_secs(3) && took < Duration::from_secs(8),
+        "took {took:?}"
+    );
+    assert_eq!(hud, vec!["show exec.stubborn", "hide"]);
 }

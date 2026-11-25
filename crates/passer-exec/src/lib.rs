@@ -157,39 +157,81 @@ impl Module for Exec {
             mut incoming,
             outgoing,
         } = io;
-        let outgoing = Arc::new(outgoing);
 
-        // Caller to stdin. Ends when the caller is done (stdin closes) or the stream breaks.
-        let to_child = async move {
-            while let Ok(Some(bytes)) = incoming.next().await {
-                if stdin.write_all(&bytes).await.is_err() {
-                    break;
+        // Caller to stdin. Returns when the caller is done (stdin then closes, which
+        // tells the command) or the stream broke (the caller vanished).
+        let mut to_child = Box::pin(async move {
+            loop {
+                match incoming.next().await {
+                    Ok(Some(bytes)) => {
+                        if stdin.write_all(&bytes).await.is_err() {
+                            return Input::Done;
+                        }
+                    }
+                    Ok(None) => return Input::Done,
+                    Err(_) => return Input::Broken,
                 }
             }
-            drop(stdin);
-        };
-        // stdout to caller, until the command closes it.
-        let from_child = async {
+        });
+        // stdout to caller. `true`: the command closed it; `false`: the caller is gone.
+        let mut from_child = Box::pin(async move {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
                 match stdout.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => return true,
                     Ok(n) => {
                         if outgoing.send(&buf[..n]).await.is_err() {
-                            break;
+                            return false;
                         }
                     }
                 }
             }
+        });
+
+        // Whichever side ends first decides. A caller that left cleanly gives the
+        // command a moment to finish on its own; a caller that vanished, or a command
+        // that does not finish in time, gets it killed: never wait on it forever, or the
+        // session (and the indicator saying someone is there) would never end.
+        let mut grace: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        let kill = loop {
+            tokio::select! {
+                input = &mut to_child, if grace.is_none() => match input {
+                    Input::Done => grace = Some(Box::pin(tokio::time::sleep(GRACE))),
+                    Input::Broken => break true,
+                },
+                closed = &mut from_child => break !closed,
+                _ = async { grace.as_mut().expect("guarded").await }, if grace.is_some() => {
+                    break true;
+                }
+            }
         };
-        // The command's output decides when it is over; the input side may stop earlier.
-        let input = tokio::spawn(to_child);
-        from_child.await;
-        input.abort();
-        let status = child.wait().await.map_err(failed)?;
+        // Closes both pipes: a command blocked writing to us is released.
+        drop(to_child);
+        drop(from_child);
+        if kill {
+            let _ = child.start_kill();
+        }
+        let status = match tokio::time::timeout(GRACE, child.wait()).await {
+            Ok(status) => status.map_err(failed)?,
+            Err(_) => {
+                let _ = child.start_kill();
+                child.wait().await.map_err(failed)?
+            }
+        };
         Ok(json!({ "exit": status.code() }))
     }
 }
+
+/// How the caller's side ended.
+enum Input {
+    /// It finished sending.
+    Done,
+    /// The stream broke: the caller is gone.
+    Broken,
+}
+
+/// How long a command gets to finish once its caller is done, before it is killed.
+const GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[cfg(test)]
 mod tests {

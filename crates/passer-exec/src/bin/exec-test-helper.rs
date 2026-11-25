@@ -23,6 +23,12 @@ fn main() {
                 println!("{a}");
             }
         }
+        // Ignores its input and writes forever, like a command that misses the end.
+        Some("stubborn") => loop {
+            if std::io::stdout().write_all(&[0u8; 4096]).is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        },
         Some("tick") => loop {
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
