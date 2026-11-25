@@ -681,3 +681,67 @@ async fn a_rule_change_applies_without_a_restart() {
     pc.stop().await;
     phone.stop().await;
 }
+
+/// Stands in for the app's stream callback (Swift or Kotlin).
+#[derive(Default)]
+struct Collect {
+    bytes: Mutex<Vec<u8>>,
+    closed: Mutex<Option<Option<String>>>,
+}
+
+impl passer_ffi::StreamSink for Collect {
+    fn on_data(&self, bytes: Vec<u8>) {
+        self.bytes.lock().unwrap().extend(bytes);
+    }
+    fn on_closed(&self, error: Option<String>) {
+        *self.closed.lock().unwrap() = Some(error);
+    }
+}
+
+#[tokio::test]
+async fn apps_stream_bytes_both_ways_through_callbacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let pc = device(&dir, "pc", Arc::default());
+    pc.create_group("Walson".into(), "PC".into()).unwrap();
+    pc.add_module(Arc::new(Echo));
+    pc.set_indicator(Arc::new(Hud::default()));
+    pc.start(NetworkKind::LocalOnly, None).await.unwrap();
+    let invite = pc.invite(5, false).await.unwrap();
+    let phone = device(&dir, "phone", Arc::default());
+    phone
+        .join(invite.link, "iPhone".into(), NetworkKind::LocalOnly)
+        .await
+        .unwrap();
+    phone.start(NetworkKind::LocalOnly, None).await.unwrap();
+    phone
+        .add_peer_address("PC".into(), pc.addresses().await.unwrap().remove(0))
+        .await
+        .unwrap();
+
+    let sink = Arc::new(Collect::default());
+    let stream = phone
+        .connect_stream("PC".into(), "test.echo".into(), "{}".into(), sink.clone())
+        .await
+        .unwrap();
+    let data: Vec<u8> = (0..1024 * 1024).map(|i| (i % 249) as u8).collect();
+    for piece in data.chunks(10_000) {
+        stream.send(piece.to_vec()).await.unwrap();
+    }
+    stream.close().await;
+    let result = stream.result().await.unwrap();
+    assert_eq!(result, r#"{"echoed":true}"#);
+    // Everything came back, in order, then the stream closed cleanly.
+    for _ in 0..50 {
+        if sink.closed.lock().unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(*sink.bytes.lock().unwrap(), data);
+    assert_eq!(*sink.closed.lock().unwrap(), Some(None));
+    assert!(stream.send(vec![1]).await.is_err(), "closed for sending");
+    assert!(stream.result().await.is_err(), "the result is taken once");
+
+    pc.stop().await;
+    phone.stop().await;
+}

@@ -19,6 +19,7 @@
 
 mod files;
 mod members;
+mod streams;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -40,6 +41,7 @@ pub use passer_node::OpenStream;
 use passer_node::approval::{ApprovalModule, ApprovalPrompt, Prompter, RemoteApprover};
 use passer_node::{Group, Network, Node, NodeOptions, now_secs};
 use serde_json::Value;
+pub use streams::{StreamHandle, StreamSink};
 
 uniffi::setup_scaffolding!();
 
@@ -580,7 +582,7 @@ fn parse_input(input_json: &str) -> Result<Value, PasserError> {
 }
 
 /// The target's answer, as the app sees it.
-fn answer(response: Response) -> Result<String, PasserError> {
+pub(crate) fn answer(response: Response) -> Result<String, PasserError> {
     match response {
         Response::Ok { output } => Ok(output.to_string()),
         Response::Error { code, message } => Err(PasserError::Refused {
@@ -1413,6 +1415,22 @@ impl PasserDevice {
             r.node.bus().set_policy(policy);
         }
         Ok(())
+    }
+
+    /// Opens a stream capability on another member (by name or id), for apps that speak
+    /// a protocol of their own over it (a screen, say). What arrives goes to `sink`; send
+    /// and get the final answer through the returned handle. Waits for the other
+    /// device's approval when it asks one (up to a minute); a refusal is
+    /// `PasserError::Refused` (`denied`, `approval_timeout`, `no_indicator`...).
+    pub async fn connect_stream(
+        &self,
+        device: String,
+        capability: String,
+        input_json: String,
+        sink: Arc<dyn StreamSink>,
+    ) -> Result<Arc<StreamHandle>, PasserError> {
+        let open = self.open_stream(device, capability, input_json).await?;
+        Ok(StreamHandle::start(open, sink))
     }
 
     /// The stop button: ends every session running on this device.

@@ -1,7 +1,7 @@
 //! Test helper for passer-exec:
 //! - `echo`: copies stdin to stdout until stdin closes;
 //! - `args ...`: prints its arguments, one per line, and exits;
-//! - `tick <file>`: appends a byte to <file> every 20 ms, forever.
+//! - `tick <file>`: appends a byte to that file every 20 ms, forever.
 
 use std::io::{Read, Write};
 

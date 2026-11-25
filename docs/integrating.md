@@ -37,7 +37,10 @@ it will come.
 - **Rust hosts and raw streams**: `PasserDevice::add_module` (any `passer_bus::Module`, such
   as `passer_exec::Exec` to run a helper program over a stream), `set_indicator` (required
   for capabilities that show or control the device), and `open_stream` on the caller's
-  side. These are Rust only; Swift and Kotlin apps use the file transfers.
+  side. Swift and Kotlin apps open raw streams with `connectStream(device, capability,
+  inputJson, sink)`: what arrives goes to their `StreamSink` (`onData`, `onClosed`), and the
+  returned `StreamHandle` sends (`send`), ends this side (`close`), stops everything
+  (`cancel`) and gives the final answer (`result`).
 
 - **AI agents**: run `passer-core mcp` and grant capabilities with `passer-core grant`.
 
