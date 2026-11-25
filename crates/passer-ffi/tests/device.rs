@@ -640,3 +640,44 @@ async fn rust_hosts_add_stream_modules_and_open_streams() {
         d.stop().await;
     }
 }
+
+#[tokio::test]
+async fn a_rule_change_applies_without_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let pc = device(&dir, "pc", Arc::default());
+    pc.create_group("Walson".into(), "PC".into()).unwrap();
+    pc.start(NetworkKind::LocalOnly, None).await.unwrap();
+    let invite = pc.invite(5, false).await.unwrap();
+    let phone = device(&dir, "phone", Arc::default());
+    phone
+        .join(invite.link, "iPhone".into(), NetworkKind::LocalOnly)
+        .await
+        .unwrap();
+    phone.start(NetworkKind::LocalOnly, None).await.unwrap();
+    phone
+        .add_peer_address("PC".into(), pc.addresses().await.unwrap().remove(0))
+        .await
+        .unwrap();
+    assert!(
+        phone
+            .call("PC".into(), "device.info".into(), "{}".into())
+            .await
+            .is_ok()
+    );
+
+    // The app forbids device.info, then reloads: the next call is refused at once.
+    let deny = serde_json::json!({ "rules": [
+        { "who": { "kind": "any_device" }, "capability": "device.info", "decision": "deny" }
+    ]});
+    std::fs::write(dir.path().join("pc").join("policy.json"), deny.to_string()).unwrap();
+    pc.reload_policy().await.unwrap();
+    match phone
+        .call("PC".into(), "device.info".into(), "{}".into())
+        .await
+    {
+        Err(PasserError::Refused { code, .. }) => assert_eq!(code, "denied"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    pc.stop().await;
+    phone.stop().await;
+}

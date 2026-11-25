@@ -1403,6 +1403,18 @@ impl PasserDevice {
         node.remove(id).map_err(PasserError::invalid)
     }
 
+    /// Applies `policy.json` again, after the app changed it: new requests follow the new
+    /// rules at once, and sessions already running are left as they are (stop them with
+    /// `stop_all_sessions` if a rule now forbids them). Does nothing before `start`, which
+    /// reads the file anyway.
+    pub async fn reload_policy(&self) -> Result<(), PasserError> {
+        let policy = self.load_policy()?;
+        if let Some(r) = self.running.lock().await.as_ref() {
+            r.node.bus().set_policy(policy);
+        }
+        Ok(())
+    }
+
     /// The stop button: ends every session running on this device.
     pub async fn stop_all_sessions(&self) -> Result<(), PasserError> {
         self.node()
